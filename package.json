@@ -1,0 +1,69 @@
+{
+  "name": "@tetsuo-ai/agenc-moderation-api",
+  "version": "0.1.0",
+  "description": "Publicly callable + self-hostable moderation attestation service for the AgenC marketplace protocol — deterministic policy scan, fail-closed spec-hash binding, on-chain ListingModeration/TaskModeration recording (global authority or roster attestor).",
+  "packageManager": "npm@11.7.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "agenc-moderation-api": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "api",
+    "vercel.json",
+    "Dockerfile",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/bin.js",
+    "dev": "npm run build && node dist/bin.js"
+  },
+  "dependencies": {
+    "@solana/kit": "^6.9.0",
+    "@tetsuo-ai/marketplace-moderation": "^0.1.0",
+    "@tetsuo-ai/marketplace-sdk": "^0.7.0"
+  },
+  "devDependencies": {
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.8"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tetsuo-ai/agenc-moderation-api.git"
+  },
+  "homepage": "https://github.com/tetsuo-ai/agenc-moderation-api#readme",
+  "bugs": {
+    "url": "https://github.com/tetsuo-ai/agenc-moderation-api/issues"
+  },
+  "keywords": [
+    "solana",
+    "agenc",
+    "marketplace",
+    "moderation",
+    "attestation",
+    "content-moderation"
+  ],
+  "author": "Tetsuo AI",
+  "engines": {
+    "node": ">=20.18.0"
+  }
+}
