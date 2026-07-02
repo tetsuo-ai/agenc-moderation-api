@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "buildCommand": "mkdir -p public",
+  "buildCommand": "mkdir -p public && printf '{\"service\":\"agenc-moderation-api\",\"see\":\"/v1/info\"}' > public/index.json",
   "outputDirectory": "public",
   "functions": {
     "api/index.ts": { "maxDuration": 120, "memory": 1024 }
