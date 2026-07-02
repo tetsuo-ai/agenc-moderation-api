@@ -27,6 +27,8 @@
   ],
   "scripts": {
     "build": "tsup",
+    "build:vercel": "tsup --no-dts",
+    "vercel-build": "tsup --no-dts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "start": "node dist/bin.js",
@@ -38,6 +40,7 @@
     "@tetsuo-ai/marketplace-sdk": "^0.7.0"
   },
   "devDependencies": {
+    "@types/node": "^22.10.2",
     "tsup": "8.5.1",
     "typescript": "5.9.3",
     "vitest": "4.1.8"
