@@ -27,8 +27,6 @@
   ],
   "scripts": {
     "build": "tsup",
-    "build:vercel": "tsup --no-dts",
-    "vercel-build": "tsup --no-dts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "start": "node dist/bin.js",

@@ -3,43 +3,14 @@
  * the hosted deployment runs. `npx @tetsuo-ai/agenc-moderation-api` or
  * `docker run` (see README) boots this.
  */
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { Readable } from "node:stream";
+import { createServer } from "node:http";
+import { nodeRequestToWeb, writeWebResponse } from "./node-adapter.js";
 import { createModerationApi } from "./router.js";
 import { loadConfig } from "./config.js";
 import { loadModeratorSigner } from "./signer.js";
 import { moderationPolicyHashHex } from "./policy.js";
 import { scannerHashHex } from "./scan.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
-
-function toRequest(req: IncomingMessage): Request {
-  const host = req.headers.host ?? "localhost";
-  const url = `http://${host}${req.url ?? "/"}`;
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === "string") headers.set(key, value);
-    else if (Array.isArray(value)) headers.set(key, value.join(", "));
-  }
-  const method = req.method ?? "GET";
-  const body =
-    method === "GET" || method === "HEAD"
-      ? undefined
-      : (Readable.toWeb(req) as unknown as BodyInit);
-  return new Request(url, {
-    method,
-    headers,
-    body,
-    // Node requires this for streamed request bodies.
-    ...(body ? { duplex: "half" } : {}),
-  } as RequestInit);
-}
-
-async function writeResponse(res: ServerResponse, response: Response): Promise<void> {
-  res.statusCode = response.status;
-  response.headers.forEach((value, key) => res.setHeader(key, value));
-  const buffer = Buffer.from(await response.arrayBuffer());
-  res.end(buffer);
-}
 
 export async function startServer(port = Number(process.env.PORT ?? 8787)): Promise<void> {
   const handler = createModerationApi();
@@ -54,8 +25,8 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
   }
 
   const server = createServer((req, res) => {
-    handler(toRequest(req))
-      .then((response) => writeResponse(res, response))
+    handler(nodeRequestToWeb(req))
+      .then((response) => writeWebResponse(res, response))
       .catch(() => {
         res.statusCode = 500;
         res.end('{"ok":false,"error":"internal error"}');
