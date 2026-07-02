@@ -284,7 +284,7 @@ export async function resolveSpecAgainstHash(params: {
     try {
       canonical = await values.canonicalJobSpecHash(payload);
     } catch {
-      if (!params.rawText) {
+      if (params.rawText === undefined) {
         throw new ModerationRejectError(
           422,
           `Inline ${params.what} payload is not JSON-canonicalizable (json-stable-v1).`,
@@ -294,12 +294,22 @@ export async function resolveSpecAgainstHash(params: {
     if (canonical?.hex.toLowerCase() === target) {
       return { specHashHex: target, specHashBytes: canonical.bytes, payload };
     }
+    // Legacy content-addressed binding: sha256(raw document bytes) == target.
+    // CRITICAL: the scanned payload MUST come from those exact bytes, not from
+    // the separately-supplied `spec` (which an untrusted caller can make
+    // diverge from `rawText`). We therefore RE-PARSE the payload from rawText
+    // and scan that — the hash we bind and the content we scan are one source.
     if (params.rawText !== undefined) {
       const rawHex = createHash("sha256")
         .update(Buffer.from(params.rawText, "utf8"))
         .digest("hex");
       if (rawHex === target) {
-        return { specHashHex: target, specHashBytes: values.hexToBytes(target), payload };
+        const fromText = unwrapPayload(parseSpecDocument(params.rawText));
+        return {
+          specHashHex: target,
+          specHashBytes: values.hexToBytes(target),
+          payload: fromText,
+        };
       }
     }
     throw new ModerationRejectError(

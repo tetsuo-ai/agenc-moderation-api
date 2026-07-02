@@ -17,8 +17,20 @@ export interface RateDecision {
   allowed: boolean;
   /** Seconds the caller should wait before retrying (when denied). */
   retryAfterSeconds: number;
-  /** Which bound denied: "ip" | "global" | null. */
-  deniedBy: "ip" | "global" | null;
+  /** Which bound denied: "ip" | "global" | "shared-store-error" | null. */
+  deniedBy: "ip" | "global" | "shared-store-error" | null;
+}
+
+/**
+ * How the limiter is enforcing right now — surfaced at /v1/info so an operator
+ * can SEE whether the global economic ceiling is truly service-wide:
+ *  - "shared": Upstash configured — the global bound holds across all instances.
+ *  - "per-instance": no Upstash — the global bound is per serverless instance,
+ *    so autoscaling multiplies it. Acceptable for single-instance self-host;
+ *    NOT acceptable for a hot mainnet signer behind Vercel autoscaling.
+ */
+export function limiterMode(config: ServiceConfig): "shared" | "per-instance" {
+  return config.upstashUrl && config.upstashToken ? "shared" : "per-instance";
 }
 
 /* ----------------------------- in-memory window --------------------------- */
@@ -85,10 +97,11 @@ async function upstashIncr(
 
 /* --------------------------------- limiter -------------------------------- */
 
+/** A `null` count signals a configured-shared-store error → caller fails closed. */
 async function consume(
   config: ServiceConfig,
   key: string,
-): Promise<{ count: number; retryAfterSeconds: number }> {
+): Promise<{ count: number; retryAfterSeconds: number } | null> {
   const windowMs = config.rateLimitWindowMs;
   if (config.upstashUrl && config.upstashToken) {
     const bucket = Math.floor(Date.now() / windowMs);
@@ -104,7 +117,14 @@ async function consume(
         retryAfterSeconds: Math.max(1, Math.ceil(((bucket + 1) * windowMs - Date.now()) / 1000)),
       };
     }
-    // fall through to local on Redis failure
+    // FAIL CLOSED. When a shared limiter IS configured, losing it means we can
+    // no longer guarantee the service-wide ceiling on the hot signer key — a
+    // silent per-instance fallback would let autoscaling multiply the true
+    // spend rate exactly during a Redis incident. A brief 429 is safer than an
+    // uncapped mainnet-signing key. (Self-host with no Upstash configured never
+    // reaches here — it uses the in-memory window below, which is correct for a
+    // single instance.)
+    return null;
   }
   const entry = localIncr(key, windowMs);
   return {
@@ -115,28 +135,48 @@ async function consume(
 
 /**
  * Consume one request against BOTH the per-IP bound and the global ceiling.
- * Exceeding either denies.
+ * Exceeding either denies; a configured-shared-store error also denies
+ * (fail-closed) so the hot-key spend bound can't silently weaken.
  */
 export async function rateLimit(config: ServiceConfig, ip: string): Promise<RateDecision> {
   const perIp = await consume(config, `ip:${ip}`);
+  if (perIp === null) {
+    return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
+  }
   if (perIp.count > config.rateLimitPerIp) {
     return { allowed: false, retryAfterSeconds: perIp.retryAfterSeconds, deniedBy: "ip" };
   }
   const global = await consume(config, "global");
+  if (global === null) {
+    return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
+  }
   if (global.count > config.rateLimitGlobal) {
     return { allowed: false, retryAfterSeconds: global.retryAfterSeconds, deniedBy: "global" };
   }
   return { allowed: true, retryAfterSeconds: 0, deniedBy: null };
 }
 
-/** Best-effort client IP from proxy headers (Vercel sets x-forwarded-for). */
+/**
+ * Client IP for rate-limit bucketing. Prefers PLATFORM-SET, single-value
+ * headers that a caller cannot forge — `x-vercel-forwarded-for` and `x-real-ip`
+ * are written by Vercel/the proxy and are not attacker-appendable. Only if
+ * neither is present do we parse `x-forwarded-for`, and then the RIGHTMOST hop
+ * (the one the trusted proxy added) rather than the spoofable leftmost token.
+ * This keeps the per-IP bound meaningful behind the deploy proxy; behind an
+ * untrusted network the global ceiling remains the backstop.
+ */
 export function clientIp(request: Request): string {
+  const platform =
+    request.headers.get("x-vercel-forwarded-for")?.trim() ||
+    request.headers.get("x-real-ip")?.trim();
+  if (platform) return platform;
   const fwd = request.headers.get("x-forwarded-for");
   if (fwd) {
-    const first = fwd.split(",")[0]?.trim();
-    if (first) return first;
+    const hops = fwd.split(",").map((h) => h.trim()).filter(Boolean);
+    const rightmost = hops[hops.length - 1];
+    if (rightmost) return rightmost;
   }
-  return request.headers.get("x-real-ip")?.trim() || "unknown";
+  return "unknown";
 }
 
 /** Test hook. */

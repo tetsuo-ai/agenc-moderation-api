@@ -5,9 +5,31 @@
  * exact same handler.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
+import { MAX_BODY_BYTES } from "./limits.js";
 
-export function nodeRequestToWeb(req: IncomingMessage): Request {
+/**
+ * A pass-through that destroys the stream once more than `maxBytes` have
+ * flowed — the self-host server has no reverse proxy in front of it, so this is
+ * the hard cap that stops an unbounded socket body from being buffered into
+ * memory (the request read then rejects and the handler returns an error,
+ * instead of OOMing the single Node process).
+ */
+function byteCap(maxBytes: number): Transform {
+  let total = 0;
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        cb(new Error("request body exceeds the size limit"));
+        return;
+      }
+      cb(null, chunk);
+    },
+  });
+}
+
+export function nodeRequestToWeb(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Request {
   const host = req.headers.host ?? "localhost";
   const proto =
     (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0]?.trim() ?? "http";
@@ -20,7 +42,8 @@ export function nodeRequestToWeb(req: IncomingMessage): Request {
   const method = req.method ?? "GET";
   const init: RequestInit & { duplex?: "half" } = { method, headers };
   if (method !== "GET" && method !== "HEAD") {
-    init.body = Readable.toWeb(req) as unknown as BodyInit;
+    const capped = req.pipe(byteCap(maxBytes));
+    init.body = Readable.toWeb(capped) as unknown as BodyInit;
     init.duplex = "half";
   }
   return new Request(url, init);

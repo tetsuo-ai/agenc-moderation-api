@@ -17,7 +17,8 @@
 
 import { normalizeTaskModerationInput } from "@tetsuo-ai/marketplace-moderation";
 import { loadConfig, type ServiceConfig } from "./config.js";
-import { clientIp, rateLimit } from "./rate-limit.js";
+import { clientIp, limiterMode, rateLimit } from "./rate-limit.js";
+import { MAX_BODY_BYTES } from "./limits.js";
 import {
   attestListing,
   attestTask,
@@ -33,7 +34,6 @@ import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 
 const PDA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
-const MAX_BODY_BYTES = 512 * 1024;
 
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
@@ -59,8 +59,23 @@ function errorJson(status: number, message: string, extra?: Record<string, unkno
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
-  const raw = await request.text();
-  if (raw.length > MAX_BODY_BYTES) {
+  // Reject before buffering when the declared size is over the cap. The Node
+  // self-host adapter additionally hard-caps the stream (byteCap), so a lying
+  // or absent Content-Length cannot OOM the process; here we also re-check the
+  // materialized BYTE length (not UTF-16 code units) as the transport-agnostic
+  // backstop.
+  const declared = Number(request.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    throw new ModerationRejectError(413, "Request body too large.");
+  }
+  let raw: string;
+  try {
+    raw = await request.text();
+  } catch {
+    // The stream cap (or a client abort) fired mid-read.
+    throw new ModerationRejectError(413, "Request body too large or truncated.");
+  }
+  if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) {
     throw new ModerationRejectError(413, "Request body too large.");
   }
   let parsed: unknown;
@@ -109,14 +124,21 @@ async function gatePost(config: ServiceConfig, request: Request): Promise<Respon
   }
   const decision = await rateLimit(config, clientIp(request));
   if (!decision.allowed) {
-    return errorJson(
-      429,
+    const message =
       decision.deniedBy === "global"
         ? "The service-wide attestation ceiling for this window is exhausted. Retry shortly."
-        : "Too many requests from this address. Retry shortly.",
-      { retryAfterSeconds: decision.retryAfterSeconds },
-      // Note: Retry-After also set below.
-    );
+        : decision.deniedBy === "shared-store-error"
+          ? "Rate-limit store temporarily unavailable; requests are paused to protect the signer. Retry shortly."
+          : "Too many requests from this address. Retry shortly.";
+    return new Response(JSON.stringify({ ok: false, error: message, retryAfterSeconds: decision.retryAfterSeconds }), {
+      status: 429,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "retry-after": String(decision.retryAfterSeconds),
+        ...CORS_HEADERS,
+      },
+    });
   }
   return null;
 }
@@ -179,21 +201,19 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
   if (!task || !PDA_RE.test(task)) return errorJson(400, "Invalid taskPda.");
   if (!jobSpecHash || !HASH_RE.test(jobSpecHash)) return errorJson(400, "Invalid jobSpecHash.");
 
-  let spec = optionalObject(body.jobSpec) ?? optionalObject(body.spec);
   const text = optionalString(body.text) ?? optionalString(body.jobSpecCanonicalJson);
+  const jobSpecObject = optionalObject(body.jobSpec) ?? optionalObject(body.spec);
   let payloadHashFromText: string | null = null;
 
+  // Single source of truth: when `text` is present it is the authoritative
+  // content (the on-chain job_spec_hash is a hash OF a document, so the bytes
+  // define the content). We derive the scanned spec FROM `text` and never let a
+  // separately-supplied `jobSpec` object override it — otherwise a caller could
+  // bind an attestation to sha256(text) while the scanner saw an unrelated
+  // object. `jobSpec` is honored ONLY when no `text` was provided.
+  let spec: Record<string, unknown> | undefined;
+  let rawText: string | undefined;
   if (text) {
-    // Kit-backend parity detail for the response's moderation object: the
-    // c14n moderation-input hash (`agenc-task-moderation-c14n-v1`). Best
-    // effort — the fail-closed binding check lives in the signer.
-    try {
-      payloadHashFromText = normalizeTaskModerationInput(text).payloadHash;
-    } catch {
-      payloadHashFromText = null;
-    }
-  }
-  if (!spec && text) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -204,6 +224,17 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
       return errorJson(422, "Spec text must be a JSON object.");
     }
     spec = parsed as Record<string, unknown>;
+    rawText = text;
+    // Kit-backend parity detail for the response's moderation object: the
+    // c14n moderation-input hash (`agenc-task-moderation-c14n-v1`). Best
+    // effort — the fail-closed binding check lives in the signer.
+    try {
+      payloadHashFromText = normalizeTaskModerationInput(text).payloadHash;
+    } catch {
+      payloadHashFromText = null;
+    }
+  } else {
+    spec = jobSpecObject;
   }
   if (!spec) {
     return errorJson(400, "Provide the spec inline (jobSpec) or as text.");
@@ -211,7 +242,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
 
   const result = await attestTask(
     { rpcUrl: config.rpcUrl, attestationTtlSeconds: config.attestationTtlSeconds },
-    { task, jobSpecHash, spec, rawText: text },
+    { task, jobSpecHash, spec, rawText },
   );
   return json({
     ok: true,
@@ -251,6 +282,12 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
     scannerDescriptor: SCANNER_DESCRIPTOR,
     attestationTtlSeconds: config.attestationTtlSeconds,
     apiKeyRequired: config.apiKeys.length > 0,
+    rateLimit: {
+      mode: limiterMode(config),
+      perIp: config.rateLimitPerIp,
+      global: config.rateLimitGlobal,
+      windowMs: config.rateLimitWindowMs,
+    },
     endpoints: [
       "POST /v1/moderation/listings",
       "POST /v1/moderation/tasks",

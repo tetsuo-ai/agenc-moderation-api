@@ -157,8 +157,16 @@ authority to register your pubkey (open an issue on this repo).
 - The service **never logs the key** and only ever signs
   `record_task_moderation` / `record_listing_moderation` with it.
 - Bound abuse: keep the rate limits on (they cap how fast anyone can drain the
-  key's fee balance), and provision Upstash (`KV_REST_API_URL/TOKEN`) for a
-  shared cross-instance limit on serverless.
+  key's fee balance). **On serverless (Vercel), provision Upstash
+  (`KV_REST_API_URL`/`KV_REST_API_TOKEN`)** — the global ceiling is only truly
+  service-wide with a shared store, and the limiter now **fails closed** (429s
+  briefly) if a configured store is unreachable rather than silently degrading
+  to a per-instance count that autoscaling would multiply. `GET /v1/info`
+  reports the active mode (`rateLimit.mode`: `shared` vs `per-instance`).
+  Single-instance self-host (docker/npx) is fine on the in-memory limiter.
+- Fund the signer wallet with only a **small, bounded** SOL balance — it is the
+  ultimate cap: even if every other layer were bypassed, the key can spend no
+  more than it holds. Top it up deliberately, not with a large float.
 - If the key is compromised: rotate (revoke the roster assignment or move the
   authority) — attestations already recorded stay valid until expiry.
 
