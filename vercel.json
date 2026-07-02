@@ -1,11 +1,10 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/index.ts",
-      "use": "@vercel/node",
-      "config": { "maxDuration": 120, "memory": 1024 }
-    }
-  ],
-  "routes": [{ "src": "/(.*)", "dest": "/api/index" }]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "mkdir -p public",
+  "outputDirectory": "public",
+  "functions": {
+    "api/index.ts": { "maxDuration": 120, "memory": 1024 }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
 }
