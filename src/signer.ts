@@ -365,6 +365,11 @@ export interface ModerationResult {
   riskScore: number;
   /** Canonical spec hash (hex) — equals the on-chain spec_hash. */
   specHash: string;
+  /**
+   * The signer whose on-chain record a consumption gate must name as its
+   * P1.2 `moderator` argument. Null in verdict-only mode (no signer).
+   */
+  moderator: string | null;
   /** Present only on a CLEAN verdict that was signed + sent; null when held. */
   attestation: { signature: string; recordedAt: string; expiresAt: string | null } | null;
   /** sha256 of the moderation policy document (hex) the attestation commits to. */
@@ -476,6 +481,7 @@ export async function attestListing(
       verdict: scan.verdict,
       riskScore: scan.riskScore,
       specHash: resolved.specHashHex,
+      moderator: moderator?.address ?? null,
       attestation: null,
       policyHash,
     };
@@ -501,6 +507,7 @@ export async function attestListing(
     verdict: scan.verdict,
     riskScore: scan.riskScore,
     specHash: resolved.specHashHex,
+    moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
     policyHash,
   };
@@ -600,6 +607,7 @@ export async function attestTask(
       verdict: scan.verdict,
       riskScore: scan.riskScore,
       specHash: resolved.specHashHex,
+      moderator: moderator?.address ?? null,
       attestation: null,
       policyHash,
     };
@@ -625,6 +633,7 @@ export async function attestTask(
     verdict: scan.verdict,
     riskScore: scan.riskScore,
     specHash: resolved.specHashHex,
+    moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
     policyHash,
   };
