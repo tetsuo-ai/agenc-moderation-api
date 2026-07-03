@@ -1,6 +1,6 @@
 {
   "name": "@tetsuo-ai/agenc-moderation-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Publicly callable + self-hostable moderation attestation service for the AgenC marketplace protocol — deterministic policy scan, fail-closed spec-hash binding, on-chain ListingModeration/TaskModeration recording (global authority or roster attestor).",
   "packageManager": "npm@11.7.0",
   "type": "module",
@@ -35,7 +35,7 @@
   "dependencies": {
     "@solana/kit": "^6.9.0",
     "@tetsuo-ai/marketplace-moderation": "^0.1.0",
-    "@tetsuo-ai/marketplace-sdk": "^0.7.0"
+    "@tetsuo-ai/marketplace-sdk": "^0.8.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

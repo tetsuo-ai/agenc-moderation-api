@@ -17,7 +17,12 @@
  *  - signing is kit-native (`@solana/kit` + the marketplace SDK facade);
  *  - the signer may be the global `moderation_authority` OR a registered
  *    roster `ModerationAttestor` — when the loaded key differs from the
- *    on-chain global authority the roster PDA is attached automatically.
+ *    on-chain global authority the roster PDA is attached automatically; a
+ *    roster entry with a PENDING EXIT is rejected before signing (the P1.2
+ *    program rejects its records from the moment of `request_attestor_exit`);
+ *  - records are written to the P1.2 v2 moderator-keyed seeds
+ *    (`[..., task/listing, job_spec_hash, moderator]`) — consumers present
+ *    THIS service's moderator pubkey at the consumption gates.
  *
  * THIS SERVICE SIGNS AND PAYS REAL TRANSACTIONS on whatever cluster RPC_URL
  * points at. The router's per-IP + global rate limits are the economic bound.
@@ -190,15 +195,24 @@ async function resolveSignerMode(
     return { moderationAttestor: null };
   }
   const [attestorPda] = await findModerationAttestorPda({ attestor: moderator.address });
-  // Revocation CLOSES the assignment PDA (revoke_moderation_attestor), so
-  // existence == registered and non-revoked.
+  // Revocation (deputized entries) and FINALIZED exits close the roster PDA, so
+  // existence == registered. A REQUESTED-but-unfinalized exit still exists on
+  // chain, but the program rejects its records (`AttestorExiting`) from the
+  // moment of the request — mirror that fail-closed here instead of burning a
+  // transaction fee on a doomed record.
   const attestor = await fetchMaybeModerationAttestor(rpc, attestorPda);
   if (attestor.exists) {
+    if (attestor.data.exitAt !== 0n) {
+      throw new ModerationRejectError(
+        503,
+        "The configured signer has a pending roster exit (request_attestor_exit); the program rejects its attestations from the moment of the request. Finalize the exit and re-register, or configure a different key.",
+      );
+    }
     return { moderationAttestor: attestorPda };
   }
   throw new ModerationRejectError(
     503,
-    "The configured signer is neither the global moderation authority nor a registered, non-revoked roster ModerationAttestor on this cluster. Ask the moderation authority to register it (assign_moderation_attestor) or configure the correct key.",
+    "The configured signer is neither the global moderation authority nor a registered roster ModerationAttestor on this cluster. Self-register it permissionlessly (register_moderation_attestor, refundable bond) or have the moderation authority deputize it (assign_moderation_attestor), or configure the correct key.",
   );
 }
 
@@ -498,8 +512,9 @@ export async function attestListing(
  * PRE-PIN mode (`jobSpecHash` + inline `spec` or `specUri` provided): the
  * caller declares the hash they will pin via `set_task_job_spec`; the payload
  * must hash to it. This is the flow external marketplaces need — the
- * TaskModeration PDA (seeded by task + job_spec_hash) must exist before the
- * pin's moderation gate will pass.
+ * TaskModeration PDA (P1.2 v2: seeded by task + job_spec_hash + moderator)
+ * must exist before the pin's moderation gate will pass, and the pin
+ * transaction must present this service's moderator pubkey.
  *
  * POST-PIN mode (neither provided): reads the pinned TaskJobSpec PDA
  * (job_spec_hash + job_spec_uri) like the first-party signer.
