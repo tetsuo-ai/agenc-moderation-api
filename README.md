@@ -132,19 +132,48 @@ records).
 
 ### Whose key can sign?
 
-The deployed program accepts attestations from **either**:
+**Any wallet — roster registration is permissionless.** The deployed program
+accepts attestations from **either**:
 
 - the cluster's global `moderation_authority`
   (`ModerationConfig.moderation_authority`), or
-- any wallet registered on the **moderation-attestor roster**
-  (`assign_moderation_attestor`, live on mainnet since the 2026-07-02
-  roster-gates upgrade). Roster attestations unlock the publish/hire gates
-  exactly like the global authority's.
+- any wallet registered on the **moderation-attestor roster**. Roster
+  attestations satisfy the publish/hire gates exactly like the global
+  authority's (live on mainnet since the 2026-07-02 roster-gates upgrade),
+  and since the 2026-07-03 P1.2 open-roster upgrade **anyone can
+  self-register** — no approval, no issue to open, no tetsuo involvement.
 
 The service auto-detects which one your key is and attaches the roster PDA
 when needed. A key that is neither is rejected up front (503) with the exact
-registration it needs. To become a mainnet roster attestor, ask the moderation
-authority to register your pubkey (open an issue on this repo).
+registration it needs.
+
+#### Register your signer on the roster (mainnet, self-service)
+
+`register_moderation_attestor` self-registers the signing wallet by
+depositing a **0.25 SOL refundable bond** (plus the roster PDA's rent, ~0.002
+SOL) on its own `["moderation_attestor", <pubkey>]` PDA. The bond is an
+attributable-identity deposit — it is **never confiscatable** and is refunded
+in full when you exit. Build the instruction with the marketplace SDK
+(`@tetsuo-ai/marketplace-sdk` ^0.8.0):
+
+```ts
+import { facade } from "@tetsuo-ai/marketplace-sdk";
+
+// attestor: a TransactionSigner for the dedicated attestation wallet
+// (the same key you set as MODERATION_SIGNER_SECRET)
+const ix = await facade.registerModerationAttestor({ attestor });
+// sign + send `ix` with any @solana/kit transaction pipeline; the wallet
+// pays the PDA rent and the 0.25 SOL bond in the same instruction
+```
+
+Fund the wallet with the bond + rent + a small fee float first. Registering
+an already-rostered wallet fails (that is the "already registered" signal).
+
+To leave the roster: `facade.requestAttestorExit({ attestor })` — the program
+rejects the key's attestations from the **moment the exit is requested** —
+then, after the **7-day cooldown**, `facade.finalizeAttestorExit({ attestor })`
+closes the PDA and refunds **everything** (bond + rent) to the wallet.
+Re-registering later re-inits a fresh entry.
 
 ### Key custody
 
@@ -167,8 +196,13 @@ authority to register your pubkey (open an issue on this repo).
 - Fund the signer wallet with only a **small, bounded** SOL balance — it is the
   ultimate cap: even if every other layer were bypassed, the key can spend no
   more than it holds. Top it up deliberately, not with a large float.
-- If the key is compromised: rotate (revoke the roster assignment or move the
-  authority) — attestations already recorded stay valid until expiry.
+- If the key is compromised: rotate. For a self-registered roster key, request
+  the attestor exit (`request_attestor_exit` — its attestations are rejected
+  from that moment), finalize after the 7-day cooldown to recover the bond,
+  and register a fresh key (registration is permissionless, so the new key is
+  live immediately). For an authority-deputized key, revoke it
+  (`revoke_moderation_attestor`); for the global authority, move the
+  authority. Attestations already recorded stay valid until expiry.
 
 ### Localnet quickstart (zero → signing)
 
@@ -199,7 +233,7 @@ check a deployment runs the published policy.
 
 ```bash
 npm install
-npm run typecheck && npm test   # 37 tests: scan vectors, fail-closed hash
+npm run typecheck && npm test   # 55 tests: scan vectors, fail-closed hash
                                 # binding, policy pin, router/gates
 npm run build && npm start      # self-host on :8787
 ```
