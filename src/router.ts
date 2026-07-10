@@ -253,7 +253,18 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
     return errorJson(400, "Provide the spec inline (jobSpec) or as text.");
   }
 
-  const result = await attestTask(attestDeps(config), { task, jobSpecHash, spec, rawText });
+  // store-core's remote attestor also sends `jobSpecUri` (the hosted copy of
+  // the spec). The inline spec/text still wins RESOLUTION (single source of
+  // truth for what gets scanned), but the URI feeds the retrievability gate's
+  // candidate list — a spec hosted there passes without being force-routed
+  // through the registry pin path.
+  const result = await attestTask(attestDeps(config), {
+    task,
+    jobSpecHash,
+    spec,
+    specUri: optionalString(body.jobSpecUri),
+    rawText,
+  });
   return json({
     ok: true,
     attested: result.attestation !== null,

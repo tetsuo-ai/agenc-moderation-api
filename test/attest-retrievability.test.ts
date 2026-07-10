@@ -31,6 +31,8 @@ const state = vi.hoisted(() => ({
   fetchCalls: [] as Array<{ method: string; url: string; init?: RequestInit }>,
   specUriHandler: undefined as ((uri: string) => Promise<{ text: string; sha256: string }>) | undefined,
   blockhash: "",
+  /** On-chain ServiceListing stub data for the listing gate tests. */
+  listingData: undefined as { specHash: Uint8Array; specUri: string } | undefined,
 }));
 
 vi.mock("@solana/kit", async (importOriginal) => {
@@ -61,6 +63,8 @@ vi.mock("@tetsuo-ai/marketplace-sdk", async (importOriginal) => {
   return {
     ...actual,
     fetchMaybeTask: async () => ({ exists: true, data: {} }),
+    fetchMaybeServiceListing: async () =>
+      state.listingData ? { exists: true, data: state.listingData } : { exists: false },
     fetchMaybeModerationConfig: async () => ({
       exists: true,
       data: { moderationAuthority: state.moderatorAddress },
@@ -80,7 +84,7 @@ vi.mock("../src/ssrf-fetch.js", async (importOriginal) => {
   };
 });
 
-import { attestTask, SpecNotRetrievableError, type AttestDeps } from "../src/signer.js";
+import { attestListing, attestTask, SpecNotRetrievableError, type AttestDeps } from "../src/signer.js";
 import { createModerationApi } from "../src/router.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
@@ -126,6 +130,7 @@ beforeEach(() => {
   state.fetchCalls = [];
   state.fetchHandler = undefined;
   state.specUriHandler = undefined;
+  state.listingData = undefined;
   state.blockhash = base58Encode(new Uint8Array(32).fill(7));
   vi.stubGlobal(
     "fetch",
@@ -365,6 +370,101 @@ describe("attestTask retrievability gate (signer configured)", () => {
     expect(result.attestation).toBeNull();
     expect(result.retrievable).toBeUndefined();
     expect(state.fetchCalls).toHaveLength(0);
+    expect(state.events).not.toContain("sendTransaction");
+  });
+
+  // REVERT-SENSITIVE against the router's one-line `jobSpecUri` forward: the
+  // store-core remote attestor sends { taskPda, jobSpecHash, jobSpec |
+  // jobSpecCanonicalJson, jobSpecUri } — a raw-bytes-bound spec HOSTED at that
+  // URI must pass the gate through the SSRF-guarded URI path (it can never be
+  // registry-pinned: the registry is canonical-content-addressed).
+  it("compat endpoint honors a hosted jobSpecUri for a raw-bytes-bound spec (store-core shape)", async () => {
+    installModeratorKey();
+    __resetRateLimiterForTests();
+    const jobSpecUri = "https://store.example/specs/summarize.json";
+    // Envelope-wrapped document: sha256(raw bytes) is the binding, and it
+    // deliberately differs from the canonical payload hash.
+    const text = JSON.stringify({ version: 1, payload: PAYLOAD });
+    const rawHash = createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");
+    expect(rawHash).not.toBe(await canonicalHex(PAYLOAD));
+    // Registry has no copy; any write attempt would be refused.
+    state.fetchHandler = (method) => jsonResponse({ ok: false }, method === "GET" ? 404 : 401);
+    state.specUriHandler = async () => ({ text, sha256: rawHash });
+
+    const handler = createModerationApi({
+      jobSpecRegistryUrl: REGISTRY,
+      jobSpecRegistryToken: null,
+    });
+    const response = await handler(
+      new Request("http://svc.test/api/task-moderation/attest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          taskPda: TASK,
+          jobSpecHash: rawHash,
+          jobSpecCanonicalJson: text,
+          jobSpecUri,
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.attested).toBe(true);
+    expect(body.txSignature).not.toBeNull();
+    expect(body.retrievable).toBe(true);
+    expect(body.pinned).toBe(false);
+    expect(body.specRegistryUri).toBe(jobSpecUri);
+    // The URI was fetched through the SSRF guard; no registry write happened.
+    expect(state.events).toContain(`specUri:${jobSpecUri}`);
+    expect(state.fetchCalls.filter((c) => c.method !== "GET")).toHaveLength(0);
+  });
+});
+
+describe("attestListing retrievability gate (signer configured)", () => {
+  const LISTING = "9UEu2Gv9Q7DwBtumR2rUSq5g8v7b6mxn26ZNQCky82RJ";
+
+  it("attests an inline listing spec via the on-chain spec_uri candidate", async () => {
+    installModeratorKey();
+    const target = await canonicalHex(PAYLOAD);
+    const specUri = "https://store.example/listing-metadata.json";
+    const text = JSON.stringify(PAYLOAD);
+    state.listingData = {
+      specHash: values.hexToBytes(target),
+      specUri,
+    };
+    // Registry has no copy → the gate falls through to the on-chain URI.
+    state.fetchHandler = (method) => jsonResponse({ ok: false }, method === "GET" ? 404 : 500);
+    state.specUriHandler = async () => ({
+      text,
+      sha256: createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex"),
+    });
+
+    const result = await attestListing(DEPS, { listing: LISTING, spec: PAYLOAD });
+    expect(result.attestation).not.toBeNull();
+    expect(result.retrievable).toBe(true);
+    expect(result.pinned).toBe(false);
+    expect(result.specRegistryUri).toBe(specUri);
+    expect(state.events).toContain(`specUri:${specUri}`);
+    expect(state.events).toContain("sendTransaction");
+  });
+
+  it("REFUSES an inline listing spec when nothing hosts it — and never signs", async () => {
+    installModeratorKey();
+    const target = await canonicalHex(PAYLOAD);
+    state.listingData = {
+      specHash: values.hexToBytes(target),
+      specUri: "https://store.example/gone.json",
+    };
+    // Registry 404s, ticket mint refused, the on-chain URI is dead.
+    state.fetchHandler = (method) => jsonResponse({ ok: false }, method === "GET" ? 404 : 401);
+    // No specUriHandler: the on-chain URI fetch fails (JobSpecCheckError).
+
+    const error = await attestListing(DEPS, { listing: LISTING, spec: PAYLOAD }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(SpecNotRetrievableError);
+    expect((error as SpecNotRetrievableError).message).toContain("listing spec");
     expect(state.events).not.toContain("sendTransaction");
   });
 });

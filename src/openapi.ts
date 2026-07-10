@@ -194,7 +194,12 @@ export function openApiDocument(): Record<string, unknown> {
                     taskPda: { type: "string" },
                     jobSpecHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
                     jobSpec: { type: "object" },
-                    jobSpecUri: { type: "string" },
+                    jobSpecUri: {
+                      type: "string",
+                      description:
+                        "https URL hosting the spec — feeds the retrievability gate " +
+                        "(the inline jobSpec/text still defines what gets scanned).",
+                    },
                     jobSpecCanonicalJson: { type: "string" },
                     text: { type: "string" },
                   },

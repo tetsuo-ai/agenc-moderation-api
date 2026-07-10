@@ -133,17 +133,31 @@ function hostedEntitlementHeaders(): Record<string, string> {
   };
 }
 
-/** Read a (trusted-base) registry response body with a hard byte cap. */
+/**
+ * Read a (trusted-base) registry response body with a hard byte cap. The body
+ * is STREAMED and aborted the moment the cap is crossed — a missing or lying
+ * Content-Length cannot buffer an unbounded body into memory first.
+ */
 async function readRegistryBody(response: Response): Promise<string> {
   const declared = Number(response.headers.get("content-length") ?? 0);
   if (declared > MAX_REGISTRY_RESPONSE_BYTES) {
     throw new Error("Registry response exceeds the size cap");
   }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_REGISTRY_RESPONSE_BYTES) {
-    throw new Error("Registry response exceeds the size cap");
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > MAX_REGISTRY_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error("Registry response exceeds the size cap");
+    }
+    chunks.push(value);
   }
-  return buffer.toString("utf8");
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**

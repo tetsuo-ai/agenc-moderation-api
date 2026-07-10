@@ -145,6 +145,43 @@ describe("ensureSpecRetrievable", () => {
     expect(calls.map((c) => c.method)).toEqual(["GET"]);
   });
 
+  it("aborts an over-cap registry body mid-stream (no Content-Length) and fails closed", async () => {
+    const target = await canonicalHex(PAYLOAD);
+    let enqueued = 0;
+    const chunk = new Uint8Array(256 * 1024);
+    const oversized = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        // 64 × 256 KiB = 16 MiB — 16× the cap; the reader must cancel long
+        // before draining it all.
+        if (enqueued >= 64) {
+          controller.close();
+          return;
+        }
+        enqueued += 1;
+        controller.enqueue(chunk);
+      },
+    });
+    const { impl } = fetchStub((method) =>
+      method === "GET" ? new Response(oversized, { status: 200 }) : jsonResponse({ ok: false }, 404),
+    );
+    await expect(
+      ensureSpecRetrievable(
+        {
+          registryUrl: REGISTRY,
+          registryToken: null,
+          targetHashHex: target,
+          payload: PAYLOAD,
+          moderator: null,
+          what: "task spec",
+        },
+        { fetchImpl: impl },
+      ),
+    ).rejects.toBeInstanceOf(SpecNotRetrievableError);
+    // The stream was cancelled at the cap, not drained: ~5 chunks reach the
+    // 1 MiB cap; allow a little reader lookahead but nowhere near the 64 total.
+    expect(enqueued).toBeLessThanOrEqual(8);
+  });
+
   it("REJECTS a registry 200 whose content does not hash-match (fail-closed)", async () => {
     const target = await canonicalHex(PAYLOAD);
     const { impl } = fetchStub((method) =>
