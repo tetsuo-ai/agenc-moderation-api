@@ -46,8 +46,30 @@ const moderationResult = {
       pattern: "^[0-9a-f]{64}$",
       description: "sha256 of GET /v1/policy bytes — the on-chain policy_hash committed to.",
     },
+    retrievable: {
+      type: "boolean",
+      enum: [true],
+      description:
+        "Present only on attested results: a retrievable copy of the exact spec content " +
+        "was verified (or pinned) before the attestation was recorded.",
+    },
+    pinned: {
+      type: "boolean",
+      description:
+        "Present only on attested results: true when this service published the spec to " +
+        "the public job-spec registry itself.",
+    },
+    specRegistryUri: {
+      type: "string",
+      description: "Present only on attested results: https URL where the spec is retrievable.",
+    },
   },
 } as const;
+
+const specNotRetrievableDescription =
+  "SPEC_NOT_RETRIEVABLE (code, retryable): no retrievable copy of the spec exists at the " +
+  "public registry or an https specUri, and the service could not pin it. Host the spec, " +
+  "then retry — attestations are never recorded for content workers cannot fetch.";
 
 const errorShape = {
   type: "object",
@@ -55,6 +77,7 @@ const errorShape = {
   properties: {
     ok: { type: "boolean", enum: [false] },
     error: { type: "string" },
+    code: { type: "string", description: "Machine-readable code (e.g. SPEC_NOT_RETRIEVABLE)." },
     retryable: { type: "boolean" },
     retryAfterSeconds: { type: "integer" },
   },
@@ -81,7 +104,9 @@ export function openApiDocument(): Record<string, unknown> {
           description:
             "Reads the on-chain ServiceListing spec_hash, resolves the payload (inline spec " +
             "> specUri > on-chain spec_uri), fail-closed hash-matches it, scans, and on a " +
-            "clean verdict records record_listing_moderation.",
+            "clean verdict records record_listing_moderation. An attestation is only " +
+            "recorded after spec retrievability is established (registry, https URI, or a " +
+            "service-side pin).",
           requestBody: {
             required: true,
             content: {
@@ -102,6 +127,7 @@ export function openApiDocument(): Record<string, unknown> {
             "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
             "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
             "404": { description: "Listing not found on-chain.", content: { "application/json": { schema: errorShape } } },
+            "409": { description: specNotRetrievableDescription, content: { "application/json": { schema: errorShape } } },
             "422": { description: "Spec does not hash to the on-chain spec_hash.", content: { "application/json": { schema: errorShape } } },
             "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
             "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
@@ -115,7 +141,10 @@ export function openApiDocument(): Record<string, unknown> {
             "PRE-PIN (external marketplaces): provide jobSpecHash plus the spec inline or by " +
             "URI; the TaskModeration record is created for the hash you will pin via " +
             "set_task_job_spec. POST-PIN: omit them and the pinned TaskJobSpec is read " +
-            "from chain.",
+            "from chain. Every attestation implies retrievable content: before recording, " +
+            "the service verifies the spec is fetchable at the public job-spec registry or " +
+            "an https specUri, or pins the inline payload to the registry itself; otherwise " +
+            "it refuses with SPEC_NOT_RETRIEVABLE (409, retryable).",
           requestBody: {
             required: true,
             content: {
@@ -137,7 +166,10 @@ export function openApiDocument(): Record<string, unknown> {
             "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
             "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
             "404": { description: "Task not found on-chain.", content: { "application/json": { schema: errorShape } } },
-            "409": { description: "No job spec pinned and none provided.", content: { "application/json": { schema: errorShape } } },
+            "409": {
+              description: `No job spec pinned and none provided; or ${specNotRetrievableDescription}`,
+              content: { "application/json": { schema: errorShape } },
+            },
             "422": { description: "Spec does not hash to the expected job_spec_hash.", content: { "application/json": { schema: errorShape } } },
             "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
             "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
@@ -183,6 +215,13 @@ export function openApiDocument(): Record<string, unknown> {
                       attested: { type: "boolean" },
                       moderation: { type: "object" },
                       txSignature: { type: ["string", "null"] },
+                      retrievable: {
+                        type: "boolean",
+                        enum: [true],
+                        description: "Present only when attested — see /v1/moderation/tasks.",
+                      },
+                      pinned: { type: "boolean", description: "Present only when attested." },
+                      specRegistryUri: { type: "string", description: "Present only when attested." },
                     },
                   },
                 },

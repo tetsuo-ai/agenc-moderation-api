@@ -4,11 +4,25 @@
  * (minus secrets) at `GET /v1/info`.
  */
 
+import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
+
 export interface ServiceConfig {
   /** Solana RPC endpoint the service reads state from and sends attest txs to. */
   rpcUrl: string;
   /** Human label for the cluster (info/reporting only; the RPC is the truth). */
   cluster: string;
+  /**
+   * Job-spec registry base URL for the retrievability gate — every attestation
+   * must reference content retrievable here, at an https specUri, or pinned by
+   * this service. Default: the official marketplace registry.
+   */
+  jobSpecRegistryUrl: string;
+  /**
+   * Optional operator write token for registry pins (Authorization: Bearer).
+   * When unset, pins fall back to wallet-scoped upload tickets signed by the
+   * moderation signer key (an off-chain signature — no transaction).
+   */
+  jobSpecRegistryToken: string | null;
   /**
    * Attestation TTL in seconds. `expires_at = recordedAt + ttl`; 0 disables
    * expiry (matches the historical first-party behavior). Default 30 days.
@@ -53,6 +67,8 @@ export function loadConfig(): ServiceConfig {
   return {
     rpcUrl: nonEmpty(process.env.RPC_URL) ?? "https://api.mainnet-beta.solana.com",
     cluster: nonEmpty(process.env.CLUSTER_LABEL) ?? "mainnet",
+    jobSpecRegistryUrl: nonEmpty(process.env.JOB_SPEC_REGISTRY_URL) ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
+    jobSpecRegistryToken: nonEmpty(process.env.JOB_SPEC_REGISTRY_TOKEN),
     attestationTtlSeconds: intEnv(
       "ATTESTATION_TTL_SECONDS",
       DEFAULT_ATTESTATION_TTL_SECONDS,

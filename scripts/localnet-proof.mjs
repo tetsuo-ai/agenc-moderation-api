@@ -10,8 +10,13 @@
  *      localnet moderator key,
  *   3. POST the pre-pin task-moderation request to the running service,
  *   4. read the on-chain TaskModeration PDA and assert status=CLEAN with the
- *      policy_hash / scanner_hash / job_spec_hash the service advertised,
+ *      policy_hash / scanner_hash / job_spec_hash the service advertised —
+ *      AND that the spec was PINNED to the (stub) job-spec registry first
+ *      (every attestation implies retrievable content),
  *   5. (negative) a malicious spec is HELD (blocked, no attestation).
+ *
+ * A tiny in-process registry stub (GET/PUT /api/job-specs/<hash> + upload
+ * tickets) stands in for marketplace.agenc.tech so the proof is offline.
  *
  * Run: node scripts/localnet-proof.mjs   (localnet must be up; see agenc-protocol
  * scripts/localnet-up). Exits non-zero on any failed assertion.
@@ -19,6 +24,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import path from "node:path";
 import {
   address,
@@ -47,8 +53,69 @@ const RPC_URL = "http://127.0.0.1:8899";
 const MODERATOR_KEY_PATH = path.join(PROTOCOL_ROOT, ".localnet/keys/moderator.json");
 const PORT = 8798;
 const BASE = `http://127.0.0.1:${PORT}`;
+const REGISTRY_PORT = 8799;
+const REGISTRY_BASE = `http://127.0.0.1:${REGISTRY_PORT}`;
+const STUB_TICKET = "LOCALNET.TICKET";
 
 const rpc = createSolanaRpc(RPC_URL);
+
+/**
+ * Minimal job-spec registry stub matching the production contract the service
+ * targets: 404 for unknown objects, ticket-gated content-addressed PUT, and a
+ * permissive upload-ticket mint (production verifies the wallet signature;
+ * the stub just checks the fields exist).
+ */
+function startRegistryStub() {
+  const objects = new Map();
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const send = (status, body) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      const url = new URL(req.url, REGISTRY_BASE);
+      const objectMatch = url.pathname.match(/^\/api\/job-specs\/([0-9a-f]{64})$/);
+      if (req.method === "GET" && objectMatch) {
+        const stored = objects.get(objectMatch[1]);
+        if (!stored) return send(404, { ok: false, error: { code: "JOB_SPEC_NOT_FOUND" } });
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(stored);
+      }
+      if (req.method === "PUT" && objectMatch) {
+        if (req.headers["x-agenc-job-spec-upload-ticket"] !== STUB_TICKET) {
+          return send(401, { ok: false, error: { code: "JOB_SPEC_REGISTRY_UNAUTHORIZED" } });
+        }
+        objects.set(objectMatch[1], Buffer.concat(chunks).toString("utf8"));
+        return send(201, {
+          ok: true,
+          jobSpecHash: objectMatch[1],
+          jobSpecUri: `${REGISTRY_BASE}/api/job-specs/${objectMatch[1]}`,
+          immutable: true,
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/api/job-spec-upload-tickets") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        if (!body.authority || !body.jobSpecHash || !body.signature || !body.message) {
+          return send(400, { ok: false, error: { code: "MALFORMED_TICKET_REQUEST" } });
+        }
+        return send(201, {
+          ok: true,
+          ticket: STUB_TICKET,
+          jobSpecHash: body.jobSpecHash,
+          authority: body.authority,
+          expiresAt: new Date(Date.now() + 600_000).toISOString(),
+          header: "x-agenc-job-spec-upload-ticket",
+        });
+      }
+      return send(404, { ok: false });
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(REGISTRY_PORT, "127.0.0.1", () => resolve({ server, objects }));
+  });
+}
 
 function ok(label) { console.log(`  \x1b[32m✓\x1b[0m ${label}`); }
 function fail(label) { console.error(`  \x1b[31m✗ ${label}\x1b[0m`); process.exitCode = 1; throw new Error(label); }
@@ -161,7 +228,9 @@ async function main() {
   const jobSpecHash = canonical.hex;
   ok(`clean spec canonical hash ${jobSpecHash.slice(0, 16)}…`);
 
-  step("2. boot the built service against localnet with the moderator key");
+  step("2. boot the registry stub + the built service against localnet");
+  const registry = await startRegistryStub();
+  ok(`registry stub listening at ${REGISTRY_BASE}`);
   const child = spawn("node", ["dist/bin.js"], {
     cwd: "/home/tetsuo/git/AgenC/agenc-moderation-api",
     env: {
@@ -171,6 +240,7 @@ async function main() {
       CLUSTER_LABEL: "localnet",
       ATTESTATION_TTL_SECONDS: "0",
       MODERATION_SIGNER_SECRET: JSON.stringify(Array.from(moderatorBytes)),
+      JOB_SPEC_REGISTRY_URL: REGISTRY_BASE,
       RATE_LIMIT_PER_IP: "100",
       RATE_LIMIT_GLOBAL: "1000",
     },
@@ -195,8 +265,22 @@ async function main() {
     ok(`service signed record_task_moderation: ${body.attestation.signature}`);
     ok(`response specHash=${body.specHash.slice(0, 16)}… policyHash=${body.policyHash.slice(0, 16)}…`);
 
+    step("3b. every attestation implies retrievable content — the spec was pinned");
+    if (body.retrievable !== true) fail("attested response is missing retrievable:true");
+    if (body.pinned !== true) fail("service did not pin the unhosted inline spec");
+    const expectedUri = `${REGISTRY_BASE}/api/job-specs/${jobSpecHash}`;
+    if (body.specRegistryUri !== expectedUri) fail(`specRegistryUri ${body.specRegistryUri} != ${expectedUri}`);
+    const pinnedRes = await fetch(expectedUri);
+    if (!pinnedRes.ok) fail(`pinned spec is not retrievable (GET ${pinnedRes.status})`);
+    const pinnedEnvelope = await pinnedRes.json();
+    const pinnedHash = (await values.canonicalJobSpecHash(pinnedEnvelope.payload)).hex;
+    if (pinnedHash !== jobSpecHash) fail(`pinned payload hash ${pinnedHash} != ${jobSpecHash}`);
+    if (pinnedEnvelope.integrity?.payloadHash !== jobSpecHash) fail("pinned envelope integrity.payloadHash mismatch");
+    ok(`spec retrievable at ${expectedUri}; canonical hash round-trips`);
+
     step("4. verify the on-chain TaskModeration PDA");
-    const [modPda] = await findTaskModerationPda({ task: address(taskPda), jobSpecHash: canonical.bytes });
+    // P1.2 v2 moderator-keyed seeds: [task, job_spec_hash, moderator].
+    const [modPda] = await findTaskModerationPda({ task: address(taskPda), jobSpecHash: canonical.bytes, moderator: moderator.address });
     const mod = await fetchMaybeTaskModeration(rpc, modPda);
     if (!mod.exists) fail(`TaskModeration PDA ${modPda} does not exist on-chain`);
     const d = mod.data;
@@ -221,14 +305,15 @@ async function main() {
     const evilBody = await evilRes.json();
     if (evilBody.verdict !== "blocked") fail(`expected blocked, got ${evilBody.verdict}`);
     if (evilBody.attested) fail("malicious spec was attested — MONEY-PATH VIOLATION");
-    const [evilModPda] = await findTaskModerationPda({ task: address(evilTask), jobSpecHash: (await values.canonicalJobSpecHash(evilSpec)).bytes });
+    const [evilModPda] = await findTaskModerationPda({ task: address(evilTask), jobSpecHash: (await values.canonicalJobSpecHash(evilSpec)).bytes, moderator: moderator.address });
     const evilMod = await fetchMaybeTaskModeration(rpc, evilModPda);
     if (evilMod.exists) fail("a TaskModeration PDA exists for the malicious spec — it must NOT");
     ok("malicious spec blocked; no TaskModeration PDA recorded");
 
-    console.log("\n\x1b[1;32mWP-C2 PROOF PASSED\x1b[0m — the self-hosted service signed a valid, gate-consumable moderation attestation on localnet, and held a malicious one.");
+    console.log("\n\x1b[1;32mWP-C2 PROOF PASSED\x1b[0m — the self-hosted service pinned the spec, signed a valid, gate-consumable moderation attestation on localnet, and held a malicious one.");
   } finally {
     child.kill("SIGTERM");
+    registry.server.close();
   }
 }
 
