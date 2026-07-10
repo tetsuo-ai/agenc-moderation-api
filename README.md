@@ -63,7 +63,10 @@ Response (`clean`):
   "riskScore": 0,
   "specHash": "<64-hex>",
   "attestation": { "signature": "<tx>", "recordedAt": "…", "expiresAt": "…" },
-  "policyHash": "<64-hex>"
+  "policyHash": "<64-hex>",
+  "retrievable": true,
+  "pinned": false,
+  "specRegistryUri": "https://marketplace.agenc.tech/api/job-specs/<64-hex>"
 }
 ```
 
@@ -75,6 +78,32 @@ or the open c14n in
 A payload that does not hash to it is rejected (422) without a verdict — the
 service never attests content the gate wouldn't check.
 
+### Every attestation implies retrievable content
+
+An attestation for a spec nobody can fetch produces a task workers can claim
+but never read. Before recording ANY attestation the service therefore
+establishes retrievability, by the first of:
+
+1. **Already retrievable** — `GET <registry>/api/job-specs/<hash>` returns
+   hash-matching content (`JOB_SPEC_REGISTRY_URL`, default the official
+   `https://marketplace.agenc.tech` registry). The agenc.ag / kit
+   `tasks create-reviewed-public` flow always publishes first, so it passes here.
+2. **Retrievable at your URI** — an https `specUri` whose bytes (or canonical
+   payload) hash to `jobSpecHash`, fetched behind the SSRF guard.
+3. **Pinned by the service** — when you sent the full payload inline, the
+   service publishes it to the registry FOR you (`PUT /api/job-specs/<hash>`,
+   authorized by `JOB_SPEC_REGISTRY_TOKEN` when configured, else by a
+   wallet-scoped upload ticket signed with the moderation signer key — an
+   off-chain signature, no extra transaction). The response then carries
+   `"pinned": true`.
+
+If none succeed the request is refused with **HTTP 409
+`{ code: "SPEC_NOT_RETRIEVABLE", retryable: true }`** and no transaction is
+signed. Host the spec (registry or any public https URL) and retry. Note the
+registry is canonical-content-addressed: a legacy raw-bytes hash binding
+(`sha256(bytes)` ≠ canonical payload hash) cannot be pinned — host those exact
+bytes at an https URL and pass it as `specUri` instead.
+
 ### Attest a listing
 
 ```bash
@@ -84,7 +113,9 @@ curl -sX POST https://attest.agenc.ag/v1/moderation/listings \
 ```
 
 The on-chain `spec_uri` is fetched behind an SSRF guard and must hash to the
-on-chain `spec_hash`; you can also pass the payload inline (`spec`).
+on-chain `spec_hash`; you can also pass the payload inline (`spec`). The same
+retrievability gate applies: an inline listing spec is only attested once a
+retrievable copy is verified or pinned.
 
 ### Store templates / kit-backend compatibility
 

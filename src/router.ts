@@ -25,6 +25,8 @@ import {
   loadModeratorSigner,
   ModerationRejectError,
   ModerationSignerUnavailableError,
+  SpecNotRetrievableError,
+  type AttestDeps,
   type ModerationResult,
 } from "./signer.js";
 import { moderationPolicyBytes, moderationPolicyHashHex } from "./policy.js";
@@ -105,6 +107,10 @@ function attestErrorResponse(error: unknown): Response {
   if (error instanceof ModerationSignerUnavailableError) {
     return errorJson(503, error.message);
   }
+  if (error instanceof SpecNotRetrievableError) {
+    // Fail-closed retrievability refusal — retryable once the spec is hosted.
+    return errorJson(error.httpStatus, error.message, { code: error.code, retryable: true });
+  }
   if (error instanceof ModerationRejectError) {
     return errorJson(error.httpStatus, error.message);
   }
@@ -145,16 +151,26 @@ async function gatePost(config: ServiceConfig, request: Request): Promise<Respon
 
 /* ------------------------------- handlers -------------------------------- */
 
+function attestDeps(config: ServiceConfig): AttestDeps {
+  return {
+    rpcUrl: config.rpcUrl,
+    attestationTtlSeconds: config.attestationTtlSeconds,
+    jobSpecRegistryUrl: config.jobSpecRegistryUrl,
+    jobSpecRegistryToken: config.jobSpecRegistryToken,
+  };
+}
+
 async function handleListings(config: ServiceConfig, request: Request): Promise<Response> {
   const body = await readJsonBody(request);
   const listing = optionalString(body.listing) ?? optionalString(body.listingPda);
   if (!listing || !PDA_RE.test(listing)) {
     return errorJson(400, "Provide a valid listing PDA (listing).");
   }
-  const result = await attestListing(
-    { rpcUrl: config.rpcUrl, attestationTtlSeconds: config.attestationTtlSeconds },
-    { listing, spec: optionalObject(body.spec), specUri: optionalString(body.specUri) },
-  );
+  const result = await attestListing(attestDeps(config), {
+    listing,
+    spec: optionalObject(body.spec),
+    specUri: optionalString(body.specUri),
+  });
   return json({ ok: true, attested: result.attestation !== null, ...result });
 }
 
@@ -168,15 +184,12 @@ async function handleTasks(config: ServiceConfig, request: Request): Promise<Res
   if (jobSpecHash && !HASH_RE.test(jobSpecHash)) {
     return errorJson(400, "jobSpecHash must be 64 hex chars.");
   }
-  const result = await attestTask(
-    { rpcUrl: config.rpcUrl, attestationTtlSeconds: config.attestationTtlSeconds },
-    {
-      task,
-      jobSpecHash,
-      spec: optionalObject(body.spec),
-      specUri: optionalString(body.specUri),
-    },
-  );
+  const result = await attestTask(attestDeps(config), {
+    task,
+    jobSpecHash,
+    spec: optionalObject(body.spec),
+    specUri: optionalString(body.specUri),
+  });
   return json({ ok: true, attested: result.attestation !== null, ...result });
 }
 
@@ -240,10 +253,18 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
     return errorJson(400, "Provide the spec inline (jobSpec) or as text.");
   }
 
-  const result = await attestTask(
-    { rpcUrl: config.rpcUrl, attestationTtlSeconds: config.attestationTtlSeconds },
-    { task, jobSpecHash, spec, rawText },
-  );
+  // store-core's remote attestor also sends `jobSpecUri` (the hosted copy of
+  // the spec). The inline spec/text still wins RESOLUTION (single source of
+  // truth for what gets scanned), but the URI feeds the retrievability gate's
+  // candidate list — a spec hosted there passes without being force-routed
+  // through the registry pin path.
+  const result = await attestTask(attestDeps(config), {
+    task,
+    jobSpecHash,
+    spec,
+    specUri: optionalString(body.jobSpecUri),
+    rawText,
+  });
   return json({
     ok: true,
     attested: result.attestation !== null,
@@ -257,6 +278,13 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
       ...(payloadHashFromText ? { payloadHash: payloadHashFromText } : {}),
     },
     txSignature: result.attestation?.signature ?? null,
+    ...(result.attestation
+      ? {
+          retrievable: result.retrievable,
+          pinned: result.pinned,
+          specRegistryUri: result.specRegistryUri,
+        }
+      : {}),
   });
 }
 
@@ -281,6 +309,11 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
     scannerHash: scannerHashHex(),
     scannerDescriptor: SCANNER_DESCRIPTOR,
     attestationTtlSeconds: config.attestationTtlSeconds,
+    // The retrievability gate: every attestation implies retrievable content.
+    jobSpecRegistry: {
+      url: config.jobSpecRegistryUrl,
+      pinCredential: config.jobSpecRegistryToken ? "registry-token" : "wallet-upload-ticket",
+    },
     apiKeyRequired: config.apiKeys.length > 0,
     rateLimit: {
       mode: limiterMode(config),

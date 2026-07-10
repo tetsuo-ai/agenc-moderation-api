@@ -5,9 +5,16 @@ export {
   loadModeratorSigner,
   ModerationRejectError,
   ModerationSignerUnavailableError,
+  SpecNotRetrievableError,
   type ModerationResult,
   type AttestDeps,
 } from "./signer.js";
+export {
+  DEFAULT_JOB_SPEC_REGISTRY_URL,
+  ensureSpecRetrievable,
+  jobSpecRegistryObjectUrl,
+  type SpecRetrievability,
+} from "./retrievability.js";
 export {
   scanPayload,
   collectSpecTextInputs,

@@ -14,6 +14,10 @@
  *    fetcher (`ssrf-fetch.ts`);
  *  - only CLEAN (status 0) is ever recorded; blocked/suspicious verdicts are
  *    HELD (returned without a signature);
+ *  - EVERY ATTESTATION IMPLIES RETRIEVABLE CONTENT: before signing, a
+ *    retrievable copy of the exact spec is verified (registry GET → caller's
+ *    https URI → service-side registry pin) or the request is refused with
+ *    SPEC_NOT_RETRIEVABLE (`retrievability.ts`);
  *  - signing is kit-native (`@solana/kit` + the marketplace SDK facade);
  *  - the signer may be the global `moderation_authority` OR a registered
  *    roster `ModerationAttestor` — when the loaded key differs from the
@@ -61,27 +65,23 @@ import { base58Decode, base58Encode } from "./base58.js";
 import { fetchJobSpecBody, JobSpecCheckError } from "./ssrf-fetch.js";
 import { moderationPolicyHashBytes, moderationPolicyHashHex } from "./policy.js";
 import { MODERATION_STATUS, scanPayload, scannerHashBytes, type Verdict } from "./scan.js";
+import {
+  ModerationRejectError,
+  ModerationSignerUnavailableError,
+  SpecNotRetrievableError,
+} from "./errors.js";
+import {
+  DEFAULT_JOB_SPEC_REGISTRY_URL,
+  ensureSpecRetrievable,
+  unwrapPayload,
+  type SpecRetrievability,
+} from "./retrievability.js";
 
 /* ================================ errors ================================= */
 
-/** Thrown when the moderation signer secret is unset/invalid (callers → 503). */
-export class ModerationSignerUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ModerationSignerUnavailableError";
-  }
-}
-
-/** Thrown when the request is well-formed but the spec can't be honestly attested (callers → 4xx). */
-export class ModerationRejectError extends Error {
-  constructor(
-    public readonly httpStatus: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "ModerationRejectError";
-  }
-}
+// Defined in errors.ts (shared with the retrievability gate); re-exported here
+// to keep the public API surface unchanged.
+export { ModerationRejectError, ModerationSignerUnavailableError, SpecNotRetrievableError };
 
 /* ============================== signer key =============================== */
 
@@ -230,6 +230,11 @@ export interface ResolvedSpec {
   specHashBytes: Uint8Array;
   /** The parsed payload that was scanned. */
   payload: Record<string, unknown>;
+  /**
+   * Set when the payload was fetched (and hash-verified) from this https URI —
+   * retrievability is then proven by construction.
+   */
+  retrievedFromUri?: string;
 }
 
 /** Fetch a remote spec body behind the SSRF guard, mapping errors to a typed reject. */
@@ -260,14 +265,6 @@ function parseSpecDocument(text: string): Record<string, unknown> {
     throw new ModerationRejectError(422, "Hosted spec must be a JSON object.");
   }
   return document as Record<string, unknown>;
-}
-
-/** Unwrap a job-spec envelope to its payload; a bare payload passes through. */
-function unwrapPayload(document: Record<string, unknown>): Record<string, unknown> {
-  const inner = document.payload;
-  return inner && typeof inner === "object" && !Array.isArray(inner)
-    ? (inner as Record<string, unknown>)
-    : document;
 }
 
 /**
@@ -336,6 +333,7 @@ export async function resolveSpecAgainstHash(params: {
     throw new ModerationRejectError(400, `Provide the ${params.what} inline (spec) or by URI (specUri).`);
   }
   const { text, rawSha256Hex } = await fetchSpecBody(params.specUri);
+  const retrievedFromUri = params.specUri.trim();
   const document = parseSpecDocument(text);
   const payload = unwrapPayload(document);
 
@@ -346,10 +344,10 @@ export async function resolveSpecAgainstHash(params: {
     // Fall through to legacy raw-byte validation below.
   }
   if (canonical?.hex.toLowerCase() === target) {
-    return { specHashHex: target, specHashBytes: canonical.bytes, payload };
+    return { specHashHex: target, specHashBytes: canonical.bytes, payload, retrievedFromUri };
   }
   if (rawSha256Hex.toLowerCase() === target) {
-    return { specHashHex: target, specHashBytes: values.hexToBytes(target), payload };
+    return { specHashHex: target, specHashBytes: values.hexToBytes(target), payload, retrievedFromUri };
   }
   throw new ModerationRejectError(
     422,
@@ -374,6 +372,15 @@ export interface ModerationResult {
   attestation: { signature: string; recordedAt: string; expiresAt: string | null } | null;
   /** sha256 of the moderation policy document (hex) the attestation commits to. */
   policyHash: string;
+  /**
+   * Present only on attested results: a retrievable copy of the exact spec
+   * content was verified (or pinned) BEFORE the attestation was recorded.
+   */
+  retrievable?: true;
+  /** Present only on attested results: this service published the spec itself. */
+  pinned?: boolean;
+  /** Present only on attested results: https URL where the spec is retrievable. */
+  specRegistryUri?: string;
 }
 
 function firstTransactionSignatureBase58(signed: {
@@ -444,6 +451,10 @@ function expiresAt(ttlSeconds: number): { onChain: bigint; iso: string | null } 
 export interface AttestDeps {
   rpcUrl: string;
   attestationTtlSeconds: number;
+  /** Job-spec registry base for the retrievability gate (default: official). */
+  jobSpecRegistryUrl?: string;
+  /** Operator registry write token; wallet upload tickets are used when null. */
+  jobSpecRegistryToken?: string | null;
 }
 
 /**
@@ -488,6 +499,21 @@ export async function attestListing(
   }
 
   const mode = await resolveSignerMode(rpc, moderator);
+
+  // Every attestation implies retrievable content — fail-closed before signing
+  // (after signer-mode validation, so a misconfigured deployment never spends
+  // registry writes).
+  const retrievability = await ensureSpecRetrievable({
+    registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
+    registryToken: deps.jobSpecRegistryToken ?? null,
+    targetHashHex: resolved.specHashHex,
+    payload: resolved.payload,
+    candidateUris: [params.specUri, maybe.data.specUri as string],
+    resolvedFromUri: resolved.retrievedFromUri,
+    moderator,
+    what: "listing spec",
+  });
+
   const ttl = expiresAt(deps.attestationTtlSeconds);
   const instruction = (await facade.recordListingModeration({
     listing: listingAddr,
@@ -510,6 +536,18 @@ export async function attestListing(
     moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
     policyHash,
+    ...attestedRetrievabilityFields(retrievability),
+  };
+}
+
+/** Spread helper: the retrievability fields carried on attested results. */
+function attestedRetrievabilityFields(
+  retrievability: SpecRetrievability,
+): Pick<ModerationResult, "retrievable" | "pinned" | "specRegistryUri"> {
+  return {
+    retrievable: retrievability.retrievable,
+    pinned: retrievability.pinned,
+    specRegistryUri: retrievability.specRegistryUri,
   };
 }
 
@@ -614,6 +652,23 @@ export async function attestTask(
   }
 
   const mode = await resolveSignerMode(rpc, moderator);
+
+  // Every attestation implies retrievable content — fail-closed before
+  // signing. A CLEAN record for a spec nobody can fetch produces a task
+  // workers can claim but never read (the dead-spec incident shape). Runs
+  // after signer-mode validation so a misconfigured deployment never spends
+  // registry writes.
+  const retrievability = await ensureSpecRetrievable({
+    registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
+    registryToken: deps.jobSpecRegistryToken ?? null,
+    targetHashHex: resolved.specHashHex,
+    payload: resolved.payload,
+    candidateUris: [params.specUri],
+    resolvedFromUri: resolved.retrievedFromUri,
+    moderator,
+    what: "task spec",
+  });
+
   const ttl = expiresAt(deps.attestationTtlSeconds);
   const instruction = (await facade.recordTaskModeration({
     task: taskAddr,
@@ -636,5 +691,6 @@ export async function attestTask(
     moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
     policyHash,
+    ...attestedRetrievabilityFields(retrievability),
   };
 }
