@@ -185,7 +185,7 @@ depositing a **0.25 SOL refundable bond** (plus the roster PDA's rent, ~0.002
 SOL) on its own `["moderation_attestor", <pubkey>]` PDA. The bond is an
 attributable-identity deposit — it is **never confiscatable** and is refunded
 in full when you exit. Build the instruction with the marketplace SDK
-(`@tetsuo-ai/marketplace-sdk` ^0.8.0):
+(`@tetsuo-ai/marketplace-sdk` ^0.12.0):
 
 ```ts
 import { facade } from "@tetsuo-ai/marketplace-sdk";
