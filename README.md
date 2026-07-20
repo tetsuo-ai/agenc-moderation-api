@@ -143,7 +143,7 @@ Attestations expire after the deployment-disclosed TTL
 One codebase, three ways to run it:
 
 ```bash
-# npx (Node 20.18+)
+# npx (Node 22.23.1+)
 MODERATION_SIGNER_SECRET='[...]' RPC_URL=https://your-rpc \
   npx @tetsuo-ai/agenc-moderation-api
 
