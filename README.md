@@ -78,6 +78,13 @@ or the open c14n in
 A payload that does not hash to it is rejected (422) without a verdict — the
 service never attests content the gate wouldn't check.
 
+For a revision-5 listing hire, use the same task-specific hash that was passed
+to `hire_from_listing`. The service reads the canonical `HireRecord` and
+verifies that `jobSpecHash` equals the immutable commitment stored in the
+hired Task before it fetches, publishes, or signs anything. A legacy hired
+task with no such commitment must be cancelled and re-hired with a current
+client; direct tasks (which have no `HireRecord`) are unaffected.
+
 ### Every attestation implies retrievable content
 
 An attestation for a spec nobody can fetch produces a task workers can claim
