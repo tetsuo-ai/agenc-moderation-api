@@ -140,7 +140,9 @@ export function openApiDocument(): Record<string, unknown> {
           description:
             "PRE-PIN (external marketplaces): provide jobSpecHash plus the spec inline or by " +
             "URI; the TaskModeration record is created for the hash you will pin via " +
-            "set_task_job_spec. POST-PIN: omit them and the pinned TaskJobSpec is read " +
+            "set_task_job_spec. For revision-5 listing hires, this must equal the immutable " +
+            "task-specific commitment funded by hire_from_listing; legacy uncommitted hires " +
+            "must be cancelled and re-hired. POST-PIN: omit them and the pinned TaskJobSpec is read " +
             "from chain. Every attestation implies retrievable content: before recording, " +
             "the service verifies the spec is fetchable at the public job-spec registry or " +
             "an https specUri, or pins the inline payload to the registry itself; otherwise " +

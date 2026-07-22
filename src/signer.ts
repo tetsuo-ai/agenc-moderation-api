@@ -51,11 +51,13 @@ import {
 } from "@solana/kit";
 import {
   facade,
+  fetchMaybeHireRecord,
   fetchMaybeServiceListing,
   fetchMaybeTask,
   fetchMaybeTaskJobSpec,
   fetchMaybeModerationConfig,
   fetchMaybeModerationAttestor,
+  findHireRecordPda,
   findTaskJobSpecPda,
   findModerationConfigPda,
   findModerationAttestorPda,
@@ -556,7 +558,9 @@ function attestedRetrievabilityFields(
  *
  * PRE-PIN mode (`jobSpecHash` + inline `spec` or `specUri` provided): the
  * caller declares the hash they will pin via `set_task_job_spec`; the payload
- * must hash to it. This is the flow external marketplaces need — the
+ * must hash to it. For listing hires on revision 5+, that hash must also equal
+ * the immutable task commitment funded by `hire_from_listing`. This is the
+ * flow external marketplaces need — the
  * TaskModeration PDA (P1.2 v2: seeded by task + job_spec_hash + moderator)
  * must exist before the pin's moderation gate will pass, and the pin
  * transaction must present this service's moderator pubkey.
@@ -578,11 +582,12 @@ export async function attestTask(
   const moderator = await tryLoadModeratorSigner();
   const rpc = createSolanaRpc(deps.rpcUrl);
   const taskAddr = address(params.task);
+  let taskAccount: Awaited<ReturnType<typeof fetchMaybeTask>> | null = null;
 
   // Verdict-only mode records nothing, so the on-chain existence check adds
   // no protection — skip the read for self-contained (pre-pin) requests.
   if (moderator !== null || !(params.spec || params.specUri)) {
-    const taskAccount = await fetchMaybeTask(rpc, taskAddr);
+    taskAccount = await fetchMaybeTask(rpc, taskAddr);
     if (!taskAccount.exists) {
       throw new ModerationRejectError(404, "This task does not exist on-chain.");
     }
@@ -613,6 +618,44 @@ export async function attestTask(
     }
     if (!/^[0-9a-f]{64}$/.test(target)) {
       throw new ModerationRejectError(400, "jobSpecHash must be 64 lowercase hex chars.");
+    }
+
+    // A revision-5 listing hire commits its task-specific job-spec hash before
+    // funds move. Do not spend registry bandwidth or record an unusable
+    // attestation for a caller-substituted hash. Direct tasks have no
+    // HireRecord and therefore continue to bind at set_task_job_spec time.
+    if (moderator !== null && taskAccount?.exists) {
+      const [hireRecordPda] = await findHireRecordPda({ task: taskAddr });
+      const hireRecord = await fetchMaybeHireRecord(rpc, hireRecordPda);
+      if (hireRecord.exists) {
+        if (String(hireRecord.data.task) !== String(taskAddr)) {
+          throw new ModerationRejectError(
+            422,
+            "The canonical HireRecord does not belong to this task; refusing to attest.",
+          );
+        }
+        const description = taskAccount.data.description as Uint8Array;
+        if (!(description instanceof Uint8Array) || description.length !== 64) {
+          throw new ModerationRejectError(
+            422,
+            "The hired task has a malformed on-chain commitment; refusing to attest.",
+          );
+        }
+        const fundedHash = description.subarray(32, 64);
+        const fundedHashHex = toHex(fundedHash);
+        if (fundedHashHex === "0".repeat(64)) {
+          throw new ModerationRejectError(
+            409,
+            "This legacy listing hire has no funded task job-spec commitment. Cancel and re-hire it with a revision-5 client before requesting attestation.",
+          );
+        }
+        if (fundedHashHex !== target) {
+          throw new ModerationRejectError(
+            422,
+            "jobSpecHash does not match the immutable task job-spec commitment funded by hire_from_listing.",
+          );
+        }
+      }
     }
     resolved = await resolveSpecAgainstHash({
       targetHashHex: target,

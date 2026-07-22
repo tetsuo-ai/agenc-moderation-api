@@ -33,6 +33,9 @@ const state = vi.hoisted(() => ({
   blockhash: "",
   /** On-chain ServiceListing stub data for the listing gate tests. */
   listingData: undefined as { specHash: Uint8Array; specUri: string } | undefined,
+  /** On-chain Task/HireRecord data for revision-5 funded-hash checks. */
+  taskData: { description: new Uint8Array(64) } as { description: Uint8Array },
+  hireRecordData: undefined as { task: string } | undefined,
 }));
 
 vi.mock("@solana/kit", async (importOriginal) => {
@@ -62,7 +65,11 @@ vi.mock("@tetsuo-ai/marketplace-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tetsuo-ai/marketplace-sdk")>();
   return {
     ...actual,
-    fetchMaybeTask: async () => ({ exists: true, data: {} }),
+    fetchMaybeTask: async () => ({ exists: true, data: state.taskData }),
+    fetchMaybeHireRecord: async () =>
+      state.hireRecordData
+        ? { exists: true, data: state.hireRecordData }
+        : { exists: false },
     fetchMaybeServiceListing: async () =>
       state.listingData ? { exists: true, data: state.listingData } : { exists: false },
     fetchMaybeModerationConfig: async () => ({
@@ -84,7 +91,13 @@ vi.mock("../src/ssrf-fetch.js", async (importOriginal) => {
   };
 });
 
-import { attestListing, attestTask, SpecNotRetrievableError, type AttestDeps } from "../src/signer.js";
+import {
+  attestListing,
+  attestTask,
+  ModerationRejectError,
+  SpecNotRetrievableError,
+  type AttestDeps,
+} from "../src/signer.js";
 import { createModerationApi } from "../src/router.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
@@ -125,12 +138,20 @@ async function canonicalHex(payload: Record<string, unknown>): Promise<string> {
   return (await values.canonicalJobSpecHash(payload)).hex.toLowerCase();
 }
 
+function revision5Description(taskJobSpecHashHex: string): Uint8Array {
+  const description = new Uint8Array(64);
+  description.set(Buffer.from(taskJobSpecHashHex, "hex"), 32);
+  return description;
+}
+
 beforeEach(() => {
   state.events = [];
   state.fetchCalls = [];
   state.fetchHandler = undefined;
   state.specUriHandler = undefined;
   state.listingData = undefined;
+  state.taskData = { description: new Uint8Array(64) };
+  state.hireRecordData = undefined;
   state.blockhash = base58Encode(new Uint8Array(32).fill(7));
   vi.stubGlobal(
     "fetch",
@@ -152,6 +173,49 @@ afterEach(() => {
 });
 
 describe("attestTask retrievability gate (signer configured)", () => {
+  it("rejects a substituted hash for a revision-5 listing hire before any network or signing", async () => {
+    installModeratorKey();
+    const target = await canonicalHex(PAYLOAD);
+    state.taskData = { description: revision5Description("ab".repeat(32)) };
+    state.hireRecordData = { task: TASK };
+
+    const error = await attestTask(DEPS, {
+      task: TASK,
+      jobSpecHash: target,
+      spec: PAYLOAD,
+    }).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toBeInstanceOf(ModerationRejectError);
+    expect((error as ModerationRejectError).httpStatus).toBe(422);
+    expect((error as Error).message).toContain("immutable task job-spec commitment");
+    expect(state.fetchCalls).toHaveLength(0);
+    expect(state.events).not.toContain("sendTransaction");
+  });
+
+  it("rejects a legacy uncommitted listing hire before any network or signing", async () => {
+    installModeratorKey();
+    const target = await canonicalHex(PAYLOAD);
+    state.hireRecordData = { task: TASK };
+
+    const error = await attestTask(DEPS, {
+      task: TASK,
+      jobSpecHash: target,
+      spec: PAYLOAD,
+    }).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toBeInstanceOf(ModerationRejectError);
+    expect((error as ModerationRejectError).httpStatus).toBe(409);
+    expect((error as Error).message).toContain("Cancel and re-hire");
+    expect(state.fetchCalls).toHaveLength(0);
+    expect(state.events).not.toContain("sendTransaction");
+  });
+
   // REVERT-SENSITIVE — the dead-spec incident shape. Pre-fix, an inline spec
   // that nobody hosts anywhere still produced a signed on-chain attestation.
   it("REFUSES to attest when no retrievability path succeeds — and never signs", async () => {
@@ -173,6 +237,8 @@ describe("attestTask retrievability gate (signer configured)", () => {
   it("attests when the registry already serves the spec (GET 200, hash-matching)", async () => {
     installModeratorKey();
     const target = await canonicalHex(PAYLOAD);
+    state.taskData = { description: revision5Description(target) };
+    state.hireRecordData = { task: TASK };
     const objectUrl = `${REGISTRY}/api/job-specs/${target}`;
     state.fetchHandler = (method, url) =>
       method === "GET" && url === objectUrl
