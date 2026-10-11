@@ -15,7 +15,9 @@ const workers={'worker-1':keyAddress(W.privateKey)};
 it('recognizes only exact custom.github.baseCommit metadata and still scans other encoded text',()=>{
   expect(scanPayload({custom:{github:{baseCommit:BASE}}}).verdict).toBe('clean');
   expect(scanPayload({custom:{github:{baseCommit:'a'.repeat(64)}}}).verdict).toBe('blocked');
-  expect(scanPayload({custom:{github:{baseCommit:BASE,note:'a'.repeat(40)}}}).verdict).toBe('blocked');
+  expect(scanPayload({custom:{github:{baseCommit:BASE,note:'f'.repeat(40)}}}).verdict).toBe('blocked');
+  // Quoting the declared commit itself hides nothing; Desktop does it in the task text.
+  expect(scanPayload({custom:{github:{baseCommit:BASE,note:`Base commit: ${BASE}.`}}}).verdict).toBe('clean');
 });
 function sandbox() {
   return {clone:vi.fn(async()=>({treeSha:TREE,entries:cleanTree()})),

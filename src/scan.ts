@@ -113,12 +113,25 @@ const POLICY_RULES: PolicyRule[] = [
 export const SCANNER_DESCRIPTOR = 'agenc-desktop:scanner:v1';
 const NORMALIZATION_VERSION = 'nfkc-controls-keys-values-decode-v1';
 export function scannerBundle(): string {
-  return JSON.stringify({ normalization: NORMALIZATION_VERSION, maxDepth:32, maxTextInputs:256, decodeRounds:3, decodeSurfaces:32, repoHexMetadata:["baseCommit","treeSha","allowedPathsHash","testCommandHash"], githubBaseCommitMetadata:true, workerImageDigest: process.env.WORKER_IMAGE_DIGEST ?? null,
+  return JSON.stringify({ normalization: NORMALIZATION_VERSION, maxDepth:32, maxTextInputs:512, distinctTextInputs:true, quotedBaseCommit:true, camelCaseIdentifiersNotBlobs:true, sandboxDeniedEnvNames:true, decodeRounds:3, decodeSurfaces:32, repoHexMetadata:["baseCommit","treeSha","allowedPathsHash","testCommandHash"], githubBaseCommitMetadata:true, workerImageDigest: process.env.WORKER_IMAGE_DIGEST ?? null,
     rules: POLICY_RULES.map(r => ({id:r.ruleId,severity:r.severity,category:r.category,bit:r.categoryBit.toString(),patterns:r.patterns.map(p=>({source:p.source,flags:p.flags}))})) });
 }
 export function scannerHashBytes(): Uint8Array { return createHash('sha256').update(scannerBundle()).digest(); }
 export function scannerHashHex(): string { return Buffer.from(scannerHashBytes()).toString('hex'); }
-const MAX_TEXT_INPUTS = 256;
+// Distinct strings only: a kit job spec repeats the same keys and values in every
+// execution criterion, and scanning one string twice gives the same answer.
+const MAX_TEXT_INPUTS = 512;
+const BLOCKED_ENV_PATH = /^spec\.execution\.sandbox\.environment\.blockedEnvPrefixes\[\d+\]$/;
+const IDENTIFIER = /\b(?:[a-z]+|[A-Z][a-z]+)(?:[A-Z][a-z]+)+\b/g;
+function declaredBaseCommits(payload: Record<string, unknown>): string[] {
+  const pick = (value: unknown) => {
+    const commit = value && typeof value === 'object' ? (value as {baseCommit?: unknown}).baseCommit : undefined;
+    return typeof commit === 'string' && /^[0-9a-f]{40}$/.test(commit) ? [commit] : [];
+  };
+  const custom = payload.custom && typeof payload.custom === 'object' ? (payload.custom as {github?: unknown}).github : undefined;
+  return [...new Set([...pick(custom), ...pick(payload.repo)])];
+}
+const HEX_METADATA_PATH = /^spec\.(?:repo\.(?:baseCommit|treeSha|allowedPathsHash|testCommandHash)|custom\.github\.baseCommit)$/;
 const TRUNCATED_INPUT_CATEGORY_BIT = 1n << 5n;
 const CONTROLS = /[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
 function normalized(s: string): string { return s.normalize('NFKC').replace(CONTROLS,''); }
@@ -152,24 +165,28 @@ interface SpecTextCollection {
   reasons?: string[];
 }
 
-function collectStringsRecursively(value: unknown, path: string, out: SpecTextInput[], depth = 0): boolean {
+function collectStringsRecursively(value: unknown, path: string, out: SpecTextInput[], depth = 0, seen = new Set<string>()): boolean {
   if(depth > 32) return true;
   if (typeof value === "string") {
-    if (!value.trim()) return false;
+    // Hex metadata fields are exempt from the encoded-blob rule only at their own path, so the
+    // same string anywhere else must still be scanned on its own.
+    const metadata = HEX_METADATA_PATH.test(path);
+    if (!value.trim() || (!metadata && seen.has(value))) return false;
     if (out.length >= MAX_TEXT_INPUTS) return true;
+    if (!metadata) seen.add(value);
     out.push({ source: path, value });
     return false;
   }
   if (Array.isArray(value)) {
     for (const [index, item] of value.entries()) {
-      if (collectStringsRecursively(item, `${path}[${index}]`, out, depth+1)) return true;
+      if (collectStringsRecursively(item, `${path}[${index}]`, out, depth+1, seen)) return true;
     }
     return false;
   }
   if (value && typeof value === "object") {
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (collectStringsRecursively(key, `${path}.${key}#key`, out, depth+1)) return true;
-      if (collectStringsRecursively(item, `${path}.${key}`, out, depth+1)) return true;
+      if (collectStringsRecursively(key, `${path}.${key}#key`, out, depth+1, seen)) return true;
+      if (collectStringsRecursively(item, `${path}.${key}`, out, depth+1, seen)) return true;
     }
   }
   return false;
@@ -213,6 +230,7 @@ export function scanPayload(payload: Record<string, unknown>): ScanResult {
       status: MODERATION_STATUS.BLOCKED,
       riskScore: HEURISTIC_RISK_SCORE.blocked,
       categoryMask: TRUNCATED_INPUT_CATEGORY_BIT,
+      reasons: ['INPUT_LIMIT'],
       truncated: true,
     };
   }
@@ -220,12 +238,20 @@ export function scanPayload(payload: Record<string, unknown>): ScanResult {
   let hasWarning = false;
   let categoryMask = 0n;
   const categories = new Set<string>(); const reasons = new Set<string>();
+  const commits = declaredBaseCommits(payload);
   for (const input of inputs) {
     const metadataHash = (/^spec\.repo\.(baseCommit|treeSha|allowedPathsHash|testCommandHash)$/.test(input.source) && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.value)) ||
       (input.source === 'spec.custom.github.baseCommit' && /^[0-9a-f]{40}$/.test(input.value));
+    // An env var name in the sandbox deny-list names what the worker must never see.
+    const deniedEnvName = BLOCKED_ENV_PATH.test(input.source) && /^[A-Z][A-Z0-9_]{1,63}$/.test(input.value);
+    // The declared base commit may be quoted in prose; any other hex run is still a blob.
+    const text = commits.reduce((current, commit) => current.split(commit).join('base-commit'), input.value);
     for (const rule of POLICY_RULES) {
       if(metadataHash && rule.ruleId === 'ENCODED_BLOB') continue;
-      if (!surfaces(input.value).some(value => rule.patterns.some(pattern => pattern.test(value)))) continue;
+      if(deniedEnvName && rule.ruleId === 'PROMPT_OR_SECRET_EXFILTRATION') continue;
+      // camelCase schema identifiers are not base64; their decoded surfaces still face every other rule.
+      const subject = rule.ruleId === 'ENCODED_BLOB' ? text.replace(IDENTIFIER, ' ') : text;
+      if (!surfaces(subject).some(value => rule.patterns.some(pattern => pattern.test(value)))) continue;
       categories.add(rule.category); reasons.add(rule.ruleId);
       categoryMask |= rule.categoryBit;
       if (rule.severity === "reject") hasReject = true;

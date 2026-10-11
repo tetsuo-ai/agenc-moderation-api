@@ -59,7 +59,9 @@ function sandbox() {
   test:vi.fn(async()=>({exitCode:0 as number|null,timedOut:false,outputSha256:hash('test output')})),close:vi.fn(async()=>{})} satisfies Sandbox;
 }
 function record() { const committedHash=store.get(TASK)?.hash ?? state.hash; return {task:TASK,creator:state.creator,moderator:state.moderator,jobSpecHash:Buffer.from(committedHash,'hex'),
- status:0,riskScore:0,categoryMask:0n,policyHash:moderationPolicyHashBytes(),scannerHash:Buffer.from(scannerHash(DIGEST),'hex'),recordedAt:BigInt(Math.floor(Date.now()/1000)),expiresAt:BigInt(Math.floor(Date.now()/1000)+72*3600)}; }
+ status:0,riskScore:0,categoryMask:0n,policyHash:moderationPolicyHashBytes(),scannerHash:Buffer.from(scannerHash(DIGEST),'hex'),recordedAt:BigInt(Math.floor(Date.now()/1000)),
+ // A minute of margin: this record exists before the verdict, which must not outlive it across a second boundary.
+ expiresAt:BigInt(Math.floor(Date.now()/1000)+72*3600+60)}; }
 function api() { return createModerationApi({storePath:join(fixture.directory,'queue.sqlite'),rateLimitPerIp:1000,rateLimitGlobal:1000},deps); }
 function post(path:string,body:unknown) { return handler(new Request('https://signer.test'+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})); }
 function intake(task=TASK) { return post('/v1/moderation/tasks',{task,jobSpecHash:state.hash,spec:PAYLOAD,specUri:'https://spec.test'}); }
