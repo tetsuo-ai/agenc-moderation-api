@@ -64,7 +64,7 @@ export function authorizedVerdictKey(moderator: string | null): {
         throw new Error('Separate verdict key required');
     const manifest = loadKeyManifest();
     const keys = manifest.body.keys;
-    const entry = Array.isArray(keys) ? keys.find(k => k.publicKey === pub && k.purpose === 'verdict' && Date.parse(k.notBefore) <= Date.now() && Date.parse(k.notAfter) > Date.now()) : undefined;
+    const entry = Array.isArray(keys) ? keys.find(k => k.publicKey === pub && k.purpose === 'verdict' && !k.revoked && Date.parse(k.notBefore) <= Date.now() && Date.parse(k.notAfter) > Date.now()) : undefined;
     if (!entry || typeof entry.keyId !== 'string')
         throw new Error('Verdict key not authorized');
     return { key, keyId: entry.keyId };

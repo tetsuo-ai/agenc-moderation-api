@@ -6,7 +6,7 @@ import { IMAGE, LIMITS, LICENSES, hash, type TreeEntry } from './types.js';
 // not a version label. Ship these source files with the compiled release.
 export const RULE_FILES = ['worker/types.ts','worker/protocol.ts','worker/rules.ts','worker/tree.ts',
   'worker/dependencies.ts','worker/github.ts','worker/http.ts','worker/artifact.ts',
-  'worker/container.ts','worker/consumer.ts','worker/bin.ts','src/repo-review.ts','src/verdict.ts',
+  'worker/queue-http.ts','src/repo-queue.ts','src/signer.ts','src/store.ts','src/binding.ts','src/router.ts','src/config.ts','worker/container.ts','worker/consumer.ts','worker/bin.ts','src/repo-review.ts','src/verdict.ts',
   'src/base58.ts','src/ssrf-fetch.ts','src/json-depth.ts','src/policy.ts','src/scan.ts','package-lock.json',
   'tsup.config.ts','tsconfig.json'];
 export function scannerHash(imageDigest: string, root = new URL('../', import.meta.url)): string {

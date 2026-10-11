@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 /** Non-secret environment configuration for the single-host attestor. */
 
 import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
@@ -5,6 +6,8 @@ import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
 export interface ServiceConfig {
   /** Solana RPC endpoint the service reads state from and sends attest txs to. */
   rpcUrl: string;
+  repositoryWorkers: Record<string,string>;
+  repositoryImageDigest: string | null;
   pinEnabled: boolean;
   storePath: string;
   spendLimits: import('./store.js').SpendLimits;
@@ -57,6 +60,8 @@ export const DEFAULT_ATTESTATION_TTL_SECONDS = 72 * 60 * 60; // 72 hours
 
 export function loadConfig(): ServiceConfig {
   return {
+    repositoryWorkers: process.env.WORKER_KEYS_FILE ? JSON.parse(readFileSync(process.env.WORKER_KEYS_FILE,'utf8')) : {},
+    repositoryImageDigest: nonEmpty(process.env.WORKER_IMAGE_DIGEST),
     pinEnabled: process.env.ENABLE_SPEC_PINNING === '1',
     storePath: process.env.ATTESTATION_DB_PATH ?? './data/attestations.sqlite',
     spendLimits: {hourlyLamports:intEnv('SPEND_HOURLY_LAMPORTS',30_000_000),dailyLamports:intEnv('SPEND_DAILY_LAMPORTS',150_000_000),dailyIntakes:intEnv('CREATOR_DAILY_INTAKES',20),hourlyTasks:intEnv('CREATOR_HOURLY_TASKS',5),walletFloor:intEnv('WALLET_FLOOR_LAMPORTS',100_000_000)},

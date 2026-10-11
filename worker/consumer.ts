@@ -62,7 +62,7 @@ export async function processJob(input: Job, deps: WorkerDeps): Promise<SignedDo
             if (decision(report.checks) === 'pass' && next.npmSupported) {
               report.tests = await sandbox.test(job.github);
               report.checks.push(check('tests',report.tests.exitCode === 0 && !report.tests.timedOut ? 'pass':'reject',
-                ...(report.tests.timedOut ? ['Test timeout']:[])));
+                ...(report.tests.timedOut ? ['Test timeout']:report.tests.exitCode !== 0 ? ['Tests failed']:[])));
             }
           }
         }

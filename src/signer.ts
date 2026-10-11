@@ -1,3 +1,6 @@
+import { scannerHash as repositoryScannerHash } from '../worker/rules.js';
+import { validateJob, type GithubSpec } from '../worker/types.js';
+import type { GithubClient } from '../worker/github.js';
 import { assertJsonDepth } from './json-depth.js';
 /** Creator-bound revision 5 task intake. All network boundaries are mockable in tests. */
 
@@ -365,6 +368,8 @@ export interface ModerationResult {
   /** Present only on attested results: https URL where the spec is retrievable. */
   specRegistryUri?: string;
   pending?: boolean;
+  jobId?: string;
+  retryAfterSeconds?: number;
   preflightOnly?: boolean;
   wouldAttest?: boolean;
   signedVerdict?: SignedDocument;
@@ -441,6 +446,7 @@ export interface AttestDeps {
   cluster?: string;
   store?: AttestationStore;
   spendLimits?: SpendLimits;
+  repository?: { workers: Readonly<Record<string,string>>; imageDigest: string; github?: GithubClient };
 }
 
 /** Removed desktop listing-write surface. */
@@ -476,39 +482,74 @@ export async function attestTask(deps: AttestDeps, params: {
   if(!/^[0-9a-f]{64}$/.test(target)) throw new ModerationRejectError(400,'Invalid hash.');
   if(pinned.exists && toHex(pinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Different hash already pinned.');
   const store = deps.store ?? getStore();
-  const authenticatedCreator = bindRequester(task.data,params.task,target,params.creatorAuthorization,store,params.preflightOnly);
+  const queuedJob = store.intakeJob(params.task,target);
+  const queuedContext = queuedJob ? JSON.parse(queuedJob.context) as import('./store.js').QueueContext : undefined;
+  const priorAuthorization = queuedContext?.authenticatedCreator && queuedContext.creator === task.data.creator;
+  const admittedAuthorization = queuedContext?.creatorAuthorization && JSON.stringify(queuedContext.creatorAuthorization) === JSON.stringify(params.creatorAuthorization);
+  const authenticatedCreator = priorAuthorization && (!params.creatorAuthorization || admittedAuthorization)
+    ? (task.data.status === 0 && task.data.currentWorkers === 0 && task.data.completions === 0 ? true : (()=>{throw new ModerationRejectError(409,'Task changed.');})())
+    : bindRequester(task.data,params.task,target,params.creatorAuthorization,store,params.preflightOnly);
   const existing = store.get(params.task);
-  if(existing && (existing.expires > Date.now() || ['reserved','pending'].includes(existing.state)) && existing.hash !== target) throw new ModerationRejectError(409,'One live hash per task.');
+  if(existing && (existing.expires > Date.now() || ['queued','reserved','pending'].includes(existing.state)) && existing.hash !== target) throw new ModerationRejectError(409,'One live hash per task.');
   const resolved = await resolveSpecAgainstHash({targetHashHex:target,spec:params.spec,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined),rawText:params.rawText,what:'task spec'});
-  const repo = resolved.payload.repo;
+  let repo = resolved.payload.repo;
   const custom = resolved.payload.custom as {github?:unknown} | undefined;
-  if (custom?.github !== undefined) throw new ModerationRejectError(409,'Repository worker review required before Desktop intake; use reviewWorkerReport.');
+  let reviewed: SignedDocument | undefined;
+  if (custom?.github !== undefined) {
+    if(params.preflightOnly) return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator?.address ?? null,attestation:null,policyHash:moderationPolicyHashHex(),preflightOnly:true,wouldAttest:false};
+    if((await values.canonicalJobSpecHash(resolved.payload)).hex !== target) throw new ModerationRejectError(422,'Repository intake requires the canonical job spec hash.');
+    if(!deps.repository || !Object.keys(deps.repository.workers).length || !moderator) throw new ModerationRejectError(503,'Repository worker and R required.');
+    if(queuedJob?.reviewed) {
+      reviewed = JSON.parse(queuedJob.reviewed) as SignedDocument;
+      if(reviewed.body.scannerHash !== repositoryScannerHash(deps.repository.imageDigest) || reviewed.body.policyHash !== moderationPolicyHashHex() || Date.parse(String(reviewed.body.expiresAt)) <= Date.now()) throw new ModerationRejectError(409,'Repository review changed or expired.');
+      repo = reviewed.body.repo;
+      if(reviewed.body.verdict === 'clean' && !repo) throw new ModerationRejectError(409,'Missing repository binding.');
+    } else {
+      let job;
+      try { job = validateJob({kind:'repo-intake',taskPda:params.task,jobSpecHash:target,github:custom.github as GithubSpec}); }
+      catch { throw new ModerationRejectError(422,'Invalid repository spec.'); }
+      if(!queuedJob) {
+        authorizedVerdictKey(moderator.address);
+        await resolveSignerMode(rpc,moderator);
+        const rent=await rpc.getMinimumBalanceForRentExemption(BigInt(getTaskModerationSize())).send();
+        const {value:balance}=await rpc.getBalance(moderator.address,{commitment:'confirmed'}).send();
+        const cost=Number(rent+100_000n);
+        if(!Number.isSafeInteger(cost) || !Number.isSafeInteger(Number(balance))) throw new ModerationRejectError(503,'Invalid balance.');
+        store.reserve(params.task,target,task.data.creator,cost,Number(balance),deps.spendLimits ?? DEFAULT_SPEND_LIMITS,Date.now(),{job,context:{payload:resolved.payload,creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined)}});
+      }
+      return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator.address,attestation:null,policyHash:moderationPolicyHashHex(),pending:true,jobId:store.intakeJob(params.task,target)!.id,retryAfterSeconds:5};
+    }
+  }
   const repoFields = ['id','owner','name','licenseSpdx','baseCommit','treeSha','allowedPathsHash','maxDiffBytes','testCommandHash'];
-  if(repo !== undefined) {
+  if(repo === null && !reviewed) throw new ModerationRejectError(422,'Invalid repo metadata.');
+  if(repo != null) {
     if(!repo || typeof repo !== 'object' || Array.isArray(repo)) throw new ModerationRejectError(422,'Invalid repo metadata.');
     const r = repo as Record<string,unknown>;
-    if(repoFields.some(f=> f === 'maxDiffBytes' ? !Number.isSafeInteger(r[f]) || Number(r[f])<=0 : typeof r[f] !== 'string' || !r[f])) throw new ModerationRejectError(422,'Incomplete repo metadata.');
+    if(repoFields.some(f=> f === 'maxDiffBytes' ? !Number.isSafeInteger(r[f]) || Number(r[f])<=0 : f === 'id' && reviewed ? !Number.isSafeInteger(r[f]) || Number(r[f])<=0 : typeof r[f] !== 'string' || !r[f])) throw new ModerationRejectError(422,'Incomplete repo metadata.');
     if(!/^[0-9a-f]{40}$/.test(String(r.baseCommit)) || !/^[0-9a-f]{40}$/.test(String(r.treeSha)) || !/^[0-9a-f]{64}$/.test(String(r.allowedPathsHash)) || !/^[0-9a-f]{64}$/.test(String(r.testCommandHash))) throw new ModerationRejectError(422,'Invalid repo hashes.');
   }
   const scan = scanPayload(resolved.payload);
+  if(reviewed) Object.assign(scan,{verdict:reviewed.body.verdict,riskScore:reviewed.body.riskScore,categories:reviewed.body.categories,reasons:reviewed.body.reasons});
+  const effectiveScannerHash = reviewed ? String(reviewed.body.scannerHash) : scannerHashHex();
   const result: ModerationResult = {verdict:scan.verdict,riskScore:scan.riskScore,specHash:target,moderator:moderator?.address ?? null,attestation:null,policyHash:moderationPolicyHashHex()};
   if(params.preflightOnly) return {...result,preflightOnly:true,wouldAttest:scan.verdict === 'clean' && moderator !== null};
   const {key,keyId} = authorizedVerdictKey(result.moderator);
   const genesisHash = await rpc.getGenesisHash().send();
+  if(reviewed && (reviewed.body.genesisHash !== genesisHash || reviewed.body.creator !== task.data.creator || reviewed.body.cluster !== (deps.cluster ?? 'mainnet'))) throw new ModerationRejectError(409,'Review context changed.');
   const [pda] = moderator ? await findTaskModerationPda({task:taskAddr,jobSpecHash:resolved.specHashBytes,moderator:moderator.address}) : [null];
   const readRecord = async () => pda ? await fetchMaybeTaskModeration(rpc,pda) : null;
-  const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === result.policyHash && toHex(record.data.scannerHash as Uint8Array) === scannerHashHex() && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000));
+  const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === result.policyHash && toHex(record.data.scannerHash as Uint8Array) === effectiveScannerHash && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000));
   let record = await readRecord();
   if(existing?.result && existing.hash === target && existing.expires > Date.now()) {
     const cached = JSON.parse(existing.result) as ModerationResult;
     const cachedBody = cached.signedVerdict?.body;
-    if(cachedBody?.policyHash !== result.policyHash || cachedBody.scannerHash !== scannerHashHex() || cachedBody.genesisHash !== genesisHash || cachedBody.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS) throw new ModerationRejectError(409,'Policy changed; operator review required.');
+    if(cachedBody?.policyHash !== result.policyHash || cachedBody.scannerHash !== effectiveScannerHash || cachedBody.genesisHash !== genesisHash || cachedBody.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS) throw new ModerationRejectError(409,'Policy changed; operator review required.');
     if(existing.state === 'held' || usable(record)) return cached;
   }
-  if(existing && ['reserved','pending'].includes(existing.state) && !usable(record)) return {...result,pending:true,recordPda:pda ?? undefined,attestation:existing.signature ? {signature:existing.signature,recordedAt:new Date().toISOString(),expiresAt:null} : null};
+  if(existing && ['reserved','pending'].includes(existing.state) && !usable(record)) return {...result,pending:true,...(queuedJob ? {jobId:queuedJob.id,retryAfterSeconds:5}:{}),recordPda:pda ?? undefined,attestation:existing.signature ? {signature:existing.signature,recordedAt:new Date().toISOString(),expiresAt:null} : null};
   store.admit(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS);
   let retrievability: SpecRetrievability | undefined;
-  let expires = Math.floor(Date.now()/1000)*1000+72*3600000;
+  let expires = Math.min(Math.floor(Date.now()/1000)*1000+72*3600000,reviewed ? Date.parse(String(reviewed.body.expiresAt)):Infinity);
   if(scan.verdict === 'clean' && moderator && pda) {
     result.recordPda = pda;
     if(usable(record) && record?.exists) {
@@ -518,29 +559,31 @@ export async function attestTask(deps: AttestDeps, params: {
       if(record?.exists) throw new ModerationRejectError(409,'Existing on-chain record requires operator review.');
       const mode = await resolveSignerMode(rpc,moderator);
       retrievability = await ensureSpecRetrievable({registryUrl:deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,registryToken:deps.jobSpecRegistryToken ?? null,pinEnabled:deps.pinEnabled,authenticatedCreator,targetHashHex:target,payload:resolved.payload,candidateUris:[params.specUri],resolvedFromUri:resolved.retrievedFromUri,moderator:null,what:'task spec'});
-      const instruction = await facade.recordTaskModeration({task:taskAddr,moderator,...(mode.moderationAttestor ? {moderationAttestor:mode.moderationAttestor}:{}),jobSpecHash:resolved.specHashBytes,status:0,riskScore:scan.riskScore,categoryMask:scan.categoryMask,policyHash:moderationPolicyHashBytes(),scannerHash:scannerHashBytes(),expiresAt:BigInt(Math.floor(expires/1000))}) as Instruction;
+      const instruction = await facade.recordTaskModeration({task:taskAddr,moderator,...(mode.moderationAttestor ? {moderationAttestor:mode.moderationAttestor}:{}),jobSpecHash:resolved.specHashBytes,status:0,riskScore:scan.riskScore,categoryMask:scan.categoryMask,policyHash:moderationPolicyHashBytes(),scannerHash:Buffer.from(effectiveScannerHash,'hex'),expiresAt:BigInt(Math.floor(expires/1000))}) as Instruction;
       // Close the read/build race as far as possible without changing revision 5.
       const current = await fetchMaybeTask(rpc,taskAddr);
       if(!current.exists || current.data.creator !== task.data.creator || current.data.status !== 0 || current.data.currentWorkers !== 0 || current.data.completions !== 0) throw new ModerationRejectError(409,'Task changed.');
-      bindRequester(current.data,params.task,target,params.creatorAuthorization,store,true);
+      if(!priorAuthorization) bindRequester(current.data,params.task,target,params.creatorAuthorization,store,true);
       const latestPinned = await fetchMaybeTaskJobSpec(rpc,jobSpecPda);
       if(latestPinned.exists && toHex(latestPinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Pin changed.');
       record = await readRecord();
       if(record?.exists) throw new ModerationRejectError(409,'Record appeared; retry read.');
       const sent = await signAndSend(deps.rpcUrl,instruction,moderator,{store,task:params.task,reserve:(cost,balance)=>store.reserve(params.task,target,task.data.creator,cost,balance,deps.spendLimits ?? DEFAULT_SPEND_LIMITS)});
       result.attestation = {signature:sent.signature,recordedAt:new Date().toISOString(),expiresAt:new Date(expires).toISOString()};
-      if(sent.pending) return {...result,pending:true};
+      if(sent.pending) return {...result,pending:true,...(queuedJob ? {jobId:queuedJob.id,retryAfterSeconds:5}:{})};
     }
   }
   if(retrievability) Object.assign(result,attestedRetrievabilityFields(retrievability));
   const issuedAt = new Date().toISOString();
-  const body: Record<string,unknown> = {v:1,kind:'task-intake',cluster:deps.cluster ?? 'mainnet',genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,taskPda:params.task,creator:task.data.creator,jobSpecHash:target,jobSpecUri:retrievability?.specRegistryUri ?? params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : null),policyHash:result.policyHash,scannerHash:scannerHashHex(),verdict:scan.verdict,riskScore:scan.riskScore,categories:scan.categories ?? [],reasons:scan.reasons ?? (scan.truncated ? ['INPUT_LIMIT'] : []),record:{moderator:result.moderator,pda:pda ?? null,txSignature:result.attestation?.signature || null},issuedAt,expiresAt:new Date(expires).toISOString(),nonce:randomBytes(16).toString('hex'),keyId};
+  const body: Record<string,unknown> = {...(reviewed?.body ?? {}),v:1,kind:'task-intake',cluster:deps.cluster ?? 'mainnet',genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,taskPda:params.task,creator:task.data.creator,jobSpecHash:target,jobSpecUri:retrievability?.specRegistryUri ?? params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : null),policyHash:result.policyHash,scannerHash:effectiveScannerHash,verdict:scan.verdict,riskScore:scan.riskScore,categories:scan.categories ?? [],reasons:scan.reasons ?? (scan.truncated ? ['INPUT_LIMIT'] : []),record:{moderator:result.moderator,pda:result.attestation ? pda : null,txSignature:result.attestation?.signature || null},issuedAt,expiresAt:new Date(expires).toISOString(),nonce:randomBytes(16).toString('hex'),keyId};
   if(repo && typeof repo === 'object' && !Array.isArray(repo)) {
     const r = repo as Record<string,unknown>;
     body.repo = Object.fromEntries(repoFields.map(f=>[f,r[f]]));
   }
   result.signedVerdict = signDocument(body,key);
+  if(reviewed) store.releaseQueuedSpend(params.task);
   if(store.get(params.task)?.state === 'pending') store.finish(params.task,result,expires);
   else store.saveVerdict(params.task,target,task.data.creator,result,expires);
+  if(queuedJob && reviewed) store.finishJob(queuedJob.id,result,expires);
   return result;
 }

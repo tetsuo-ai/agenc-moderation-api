@@ -1,20 +1,93 @@
-# AgenC Desktop attestor — phases 1 and 2
+# AgenC Desktop attestor — queued repository intake and deliverable review
 
 Revision 5 task intake with creator binding, a durable SQLite journal, bounded
 payer spending, and signed off-chain verdicts. This service can sign and pay
 transactions when operated with a roster/payer key. Development tests mock all
 RPC submission and registry writes. Phase 2 adds isolated public repository
 screening, artifact review, signed worker reports and independent signer checks.
-The phase 2 internal review function is off-chain and sends no transactions or
-registry writes. No program upgrade is required.
+The internal worker review is off-chain; its durable adapter records moderation
+with R only after a clean repository report, then signs the final verdict with V.
+Deliverable review never sends a chain transaction. No program upgrade is required.
 
 ## HTTP contract
 
 - `POST /v1/moderation/tasks`: `{task, jobSpecHash, spec?, specUri?, creatorAuthorization?, preflightOnly?}`.
 - `POST /api/task-moderation/attest`: accepts `{taskPda, jobSpecHash, jobSpec?, jobSpecCanonicalJson?, text?, jobSpecUri?, creatorAuthorization?, preflightOnly?}`.
 - `GET /v1/attestations/:task/:hash`: persisted, unexpired signed result.
+- `POST /v1/moderation/deliverables`: `{task, submissionPda, artifactSha256}`.
+- `GET /v1/deliverable-reviews/:task/:submission/:artifact`: stored deliverable verdict.
 - `GET /v1/keys`: offline-root signed key manifest.
 - `GET /v1/policy`, `/v1/info`, `/v1/health`, `/openapi.json`.
+
+Desktop posts `{task, jobSpecHash, specUri, spec}`. When the canonical payload
+contains `custom.github`, the signer checks creator binding, Open/unclaimed task,
+pinned hash, one live hash, quotas, roster/key availability and spend controls,
+then atomically saves a `repo-intake` job and budget reservation in SQLite.
+The first POST returns **202**, with this response (extra scan summary fields may
+also be present):
+
+```json
+{"ok":true,"moderator":"<R>","attested":false,"pending":true,"jobId":"<uuid>","retryAfterSeconds":5,"attestation":null}
+```
+
+Repeat the same POST after five seconds, or poll the intake GET. GET returns
+**404** until a final verdict is stored; it does not start or resume work. A
+worker report is authenticated by its separate report key and independently
+rechecked by the signer against the durable spec and current task/spec/GitHub
+facts. A clean result records the revision 5 moderation PDA with R, then returns
+**200**, for example:
+
+```json
+{"ok":true,"moderator":"<R>","attested":true,"verdict":"clean","riskScore":0,"specHash":"<hash>","policyHash":"<hash>","attestation":{"signature":"<transaction signature>","recordedAt":"<ISO UTC>","expiresAt":"<ISO UTC>"},"signedVerdict":{"body":{"v":1,"kind":"task-intake","scope":"repository","repo":{"id":123,"owner":"example","name":"public-repo","licenseSpdx":"MIT","baseCommit":"<40 hex>","treeSha":"<40 hex>","allowedPathsHash":"<64 hex>","maxDiffBytes":100000,"testCommandHash":"<64 hex>"},"verdict":"clean","reasons":[],"record":{"moderator":"<R>","pda":"<moderation PDA>","txSignature":"<transaction signature>"}},"signature":"<V signature>"}}
+```
+
+The example abbreviates the signed body's context, checks and time fields;
+see the verdict contract below. `allowedPathsHash` and `testCommandHash` are
+SHA-256 of canonical JSON values. Repo ID is numeric for reviewed GitHub jobs.
+Hold maps to `suspicious`; reject maps to `blocked`. Both return **200** with
+`attested:false`, `attestation:null`, signed `reasons`, and
+`record:{moderator:"<R>",pda:null,txSignature:null}`. They create no chain record
+and release their unsent budget; their creator admission still counts.
+
+Ambiguous chain submission returns **202** with the same job ID,
+`retryAfterSeconds:5`, `pending:true`, `attested:false`, and the journaled
+`attestation.signature`. POST again after the PDA exists to finish the final
+V verdict. Retries never send another transaction. Stored results are returned
+by POST or GET with **200** until expiry. Repository preflight returns **200**,
+`preflightOnly:true`, `wouldAttest:false`; it cannot predict a worker review.
+Repository jobs require the canonical SDK payload hash; legacy raw-text hashes
+remain supported for non-repository intake only.
+
+For a deliverable, Desktop posts exactly:
+
+```json
+{"task":"<task PDA>","submissionPda":"<submission PDA>","artifactSha256":"<64 lowercase hex>"}
+```
+
+The task must be Open, InProgress or PendingValidation with the same pinned spec
+and a clean, unexpired stored repository intake. The signer independently reads
+the submission and claim, derives the submission PDA from its claim, checks
+claim task/worker ownership, requires submission status Submitted, and binds
+`artifactSha256` to the submission's 32-byte **proofHash**. The content-addressed
+artifact uses the phase 2 format below. New review: **202**
+`{ok:true,moderator:null,attested:false,pending:true,jobId,retryAfterSeconds:5}`.
+Ready review: **200**
+`{ok:true,moderator:"<R>",attested:false,verdict,attestation:null,signedVerdict:{body,signature}}`.
+The body is `kind:"deliverable-review",scope:"repository"`, bound to submission,
+artifact, accepted intake hash, manifest, resulting tree and tests. Failing
+reviews also store signed reasons. Deliverable GET is **404** while pending,
+**200** once stored. Reviews cannot outlive their accepted intake. Each distinct
+submission/artifact consumes creator scanner quota; retries consume none.
+
+Errors use `{ok:false,moderator:null,error:"Request could not be completed.",logId}`:
+**400** malformed input or JSON depth limit, **401** missing configured Desktop API key, **403**
+creator/worker authentication failure, **404** missing task/submission/result,
+**409** task/hash/submission/lease conflicts, changed policy or unavailable spec,
+**413** body size limit, **422** hash mismatch or invalid GitHub spec, **429**
+IP/creator quota or spend cap, **502** upstream/recheck/chain failure, **503**
+unavailable R/V/worker/roster or wallet floor. Spec retrievability errors also carry
+`code:"SPEC_NOT_RETRIEVABLE",retryable:true`. IP 429 includes `retryAfterSeconds`
+and a `Retry-After` header. See `/openapi.json` for request/response schemas.
 
 Listing writes return 410. POST responses have no CORS headers. Compat returns
 `moderation.status` and `verdict` as `clean`, `suspicious`, or `blocked`, and always
@@ -46,7 +119,10 @@ nonce=<lowercase hex>
 ```
 
 A verified authorization nonce is single use even if later checks refuse intake.
-Use a fresh authorization for retries, or use the commitment-bound path.
+For an already admitted repository job, the exact originally accepted
+authorization can be reused, including after its initial five-minute window;
+that durable authorization stays bound to the same task, hash and creator. Other
+requests require a fresh authorization, or the commitment-bound path.
 
 ## Verdicts and offline keys
 
@@ -92,8 +168,9 @@ historical public keys for verification for at least the 72-hour verdict TTL.
 record's expiry when reused. Repo metadata, when present, must include `id`,
 `owner`, `name`, `licenseSpdx`, 40-hex `baseCommit` and `treeSha`, 64-hex
 `allowedPathsHash` and `testCommandHash`, and positive integer `maxDiffBytes`.
-Repo fields are commitments supplied in the hashed spec, not a claim that phase 1
-has verified repository contents or license ownership.
+For `scope:repository`, these fields come from the independently rechecked worker
+report and committed `custom.github` limits. General phase 1 `payload.repo`
+metadata alone is a spec commitment and does not constitute repository screening.
 
 ## Persistent controls
 
@@ -120,7 +197,14 @@ transaction, or an expired existing PDA needs operator reconciliation. Inspect
 chain state and signature history before any manual journal change. Spend
 reservations remain conservative; they are not automatically refunded.
 
-The `audit`, `admissions`, `spend`, `nonces`, and `intakes` tables retain the local
+Queue admission reserves rent plus the bounded 100,000-lamport fee ceiling;
+completion replaces that budget with the exact transaction cost once. Queued
+budgets count toward hourly/daily caps and outstanding wallet commitments. A
+held/rejected or reused existing-record result releases an unsent queue budget.
+Submitted reservations remain conservative and are never automatically refunded.
+Expired queue work is not silently replaced; reconcile its reservation first.
+
+The `audit`, `admissions`, `spend`, `nonces`, `jobs`, and `intakes` tables retain the local
 journal. Restrict DB access to the signer OS user; back it up consistently with
 SQLite's backup tooling. Request failures return a generic message and `logId`;
 the journalctl log stores the ID and error type, without request contents or
@@ -254,10 +338,12 @@ Repo intake yields a signed `kind:"task-intake",scope:"repository"` with repo
 binding; deliverables yield `kind:"deliverable-review",scope:"repository"`
 bound to `taskPda`, `submissionPda`, `artifactSha256`, manifest, resulting tree,
 test result and `intakeHash`. Verdicts map to `clean`/`suspicious`/`blocked`.
-These off-chain documents have `record.pda:null,txSignature:null`; they do not
-create or replace revision 5 on-chain moderation records. The existing phase 1
-HTTP route refuses `custom.github` jobs to prevent bypassing repo screening.
-Wire the internal resolver/queue adapter and Desktop gate before live intake.
+Clean intake documents include the R moderation PDA/transaction after the
+queue adapter records it. Held/rejected intakes and all deliverable reviews have
+`record.pda:null,txSignature:null`. The HTTP adapter requires worker review for
+every `custom.github` intake and cannot use general phase 1 scanning to bypass it.
+`GET /v1/info` exposes the repository image and scanner commitments separately
+from the general payload scanner.
 
 Desktop must verify a deliverable-review **before** acceptance/settlement:
 
@@ -278,8 +364,56 @@ Desktop must verify a deliverable-review **before** acceptance/settlement:
 See [deploy/WORKER.md](deploy/WORKER.md) for the separate DigitalOcean worker
 unit, offline compose qualification profile, nftables egress allowlist, queue
 contract, required image qualification and hostname-gateway limitations. No
-templates have been applied. Real-container/egress qualification, a production
-durable queue bridge, trusted context wiring and Desktop consumption remain
-operator/client integration work. Heuristic license, secret, YAML and instruction
+templates have been applied. Real-container/egress qualification, droplet deployment, R roster registration,
+offline root/V ceremony and Desktop verdict consumption remain operator/client
+integration work. The durable queue and trusted context adapter are implemented. Heuristic license, secret, YAML and instruction
 scans cannot prove arbitrary repository code safe; compromised report keys or
 container/engine vulnerabilities remain risks even for a passing report.
+
+## Worker transport and local development
+
+Set `WORKER_KEYS_FILE` to a signer-readable JSON map
+`{"scanner-do-1":"<worker report Ed25519 base58 public key>"}` and
+`WORKER_IMAGE_DIGEST=sha256:<64 hex>` on the signer. Configure the identical
+image digest and `queueUrl:"https://attestor.example.com"` on the worker.
+The worker binary processes one lease at a time; no Desktop API key is needed.
+The signer owns the SQLite queue; the scanner never opens the signing database.
+
+`POST /internal/worker/pull` and `POST /internal/worker/reports` take
+`{body,signature}`. Body is
+`{workerId,path,issuedAt,nonce,payload}`. Sign with the worker report credential
+using `0xff || "agenc-worker-queue/v1" || 0x00 || canonicalJson(body)`; the path
+must equal the actual endpoint, time must be within 60 seconds (30 seconds future
+skew allowed), and nonce is fresh 16-byte lowercase hex. Nonces are durable.
+Pull payload is `{}`. Pull returns **200**
+`{moderator:null,jobId,leaseToken,leaseExpiresAt,job}` or **204** with no body.
+The lease lasts 15 minutes, covering the worker's ten-minute job bound.
+
+Report payload is `{jobId,leaseToken,report:{body,signature}}`; the inner report
+uses the existing separate report domain. A report must name the leased job and
+worker, match the current bundle/image, and pass signer binding/rechecks.
+Acknowledgement is **200** `{moderator:null,accepted:true,jobId}` after atomic
+report+replay-nonce storage. A duplicate exact report is acknowledged under a
+fresh transport nonce; a different report is **409**. Forgery is **403**; missing,
+expired or superseded lease is **409**. Crash recovery redelivers unfinished
+leases; reviewed jobs resume through Desktop POST. Chain failures after durable
+report acceptance do not discard the report or trigger another payment.
+
+Restrict these endpoints at nginx and the droplet ingress firewall to the fixed
+worker droplet IP. The public Desktop location must not provide an alternative
+route to them; direct port 8787 remains loopback-only. Add the signer TLS host to
+the controller's approved egress configuration. See [deploy/WORKER.md](deploy/WORKER.md)
+and [deploy/nginx.conf](deploy/nginx.conf); these templates have not been applied.
+
+Development can use `runDevelopmentWorkerOnce(attestDeps, workerDeps)` from the
+package. It pulls from the same persistent queue and runs `processJob` in process;
+inject a mocked `Sandbox` (clone/apply/test/close), GitHub, registry/OSV and RPC.
+It is disabled under `NODE_ENV=production`. This is dependency injection, not an
+automatic success report or a container daemon. The complete local examples are
+[test/repo-queue.test.ts](test/repo-queue.test.ts), including mocked chain recording
+and signature verification:
+
+```sh
+npm test -- --maxWorkers=2
+npm run typecheck
+```

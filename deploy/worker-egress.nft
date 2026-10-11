@@ -12,6 +12,10 @@ table inet agenc_worker_egress {
   set osv_v6 { type ipv6_addr; flags timeout; }
   set registry_v4 { type ipv4_addr; flags timeout; }
   set registry_v6 { type ipv6_addr; flags timeout; }
+  set artifact_v4 { type ipv4_addr; flags timeout; }
+  set artifact_v6 { type ipv6_addr; flags timeout; }
+  set signer_v4 { type ipv4_addr; flags timeout; }
+  set signer_v6 { type ipv6_addr; flags timeout; }
   chain output {
     type filter hook output priority -10; policy accept;
     meta skuid != $worker_uid return
@@ -26,6 +30,10 @@ table inet agenc_worker_egress {
     ip6 daddr @osv_v6 tcp dport 443 accept
     ip daddr @registry_v4 tcp dport 443 accept
     ip6 daddr @registry_v6 tcp dport 443 accept
+    ip daddr @artifact_v4 tcp dport 443 accept
+    ip6 daddr @artifact_v6 tcp dport 443 accept
+    ip daddr @signer_v4 tcp dport 443 accept
+    ip6 daddr @signer_v6 tcp dport 443 accept
     reject
   }
 }

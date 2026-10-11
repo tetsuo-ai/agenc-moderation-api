@@ -12,10 +12,10 @@ ExecStart=/usr/bin/node /opt/agenc-attestor/dist/worker.js /etc/agenc-worker/wor
 Environment=NODE_ENV=production HOME=/var/lib/agenc-worker
 Environment=REPORT_KEY_FILE=%d/report.pem
 LoadCredentialEncrypted=report.pem:/etc/credstore.encrypted/agenc-worker-report.pem
-# Queue bridge supplies bounded JSONL into this FIFO and journals stdout reports.
-# It acknowledges a lease only after report verification and durable storage.
-StandardInput=file:/var/lib/agenc-worker/jobs.fifo
-StandardOutput=append:/var/lib/agenc-worker/reports.jsonl
+# queueUrl in worker.json enables authenticated HTTP pull/report transport.
+# For the optional development JSONL adapter, override StandardInput explicitly.
+StandardInput=null
+StandardOutput=journal
 StandardError=journal
 StateDirectory=agenc-worker
 StateDirectoryMode=0700

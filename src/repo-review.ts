@@ -39,7 +39,7 @@ function acceptedIntake(doc:SignedDocument|undefined,ctx:RepoReviewContext,deps:
   const b = doc?.body;
   if (!doc || !b || b.v !== 1 || b.kind !== 'task-intake' || b.verdict !== 'clean' || b.scope !== 'repository' ||
       b.taskPda !== ctx.taskPda || b.creator !== ctx.creator || b.jobSpecHash !== ctx.jobSpecHash ||
-      b.genesisHash !== ctx.genesisHash || b.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS ||
+      b.cluster !== ctx.cluster || b.genesisHash !== ctx.genesisHash || b.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS ||
       b.scannerHash !== scannerHash(deps.imageDigest) || b.policyHash !== moderationPolicyHashHex() ||
       !Number.isFinite(Date.parse(String(b.issuedAt))) || Date.parse(String(b.issuedAt)) > now ||
       !(Date.parse(String(b.expiresAt)) > now) || typeof b.keyId !== 'string' ||
@@ -76,9 +76,9 @@ export async function reviewWorkerReport(deps:RepoReviewDeps,input:SignedDocumen
   // not produce a clean verdict or convert worker errors into approval.
   const github = deps.github ?? new GithubClient();
   const fresh = await github.inspect(job.github,report.repo?.id);
-  if (!fresh.facts || fresh.checks.some(c=>c.verdict !== 'pass') || !report.repo ||
-      objectHash(fresh.facts) !== objectHash(report.repo)) throw new Error('Signer GitHub recheck failed');
-  if (intake && objectHash(intake.repo) !== objectHash(repoBinding(report))) throw new Error('Attested base/repo mismatch');
+  if (report.verdict === 'pass' && (!fresh.facts || fresh.checks.some(c=>c.verdict !== 'pass') || !report.repo)) throw new Error('Signer GitHub recheck failed');
+  if (report.repo && (!fresh.facts || objectHash(fresh.facts) !== objectHash(report.repo))) throw new Error('Signer GitHub recheck failed');
+  if (intake && report.repo && objectHash(intake.repo) !== objectHash(repoBinding(report))) throw new Error('Attested base/repo mismatch');
   if (report.verdict === 'pass') {
     const required = [...GITHUB_CHECKS,'checkout-binding',...TREE_CHECKS,'lockfiles','osv'];
     if (job.kind === 'deliverable') required.push(...PATCH_CHECKS,'patch-apply',...TREE_CHECKS.map(id=>'result-'+id),
@@ -88,7 +88,7 @@ export async function reviewWorkerReport(deps:RepoReviewDeps,input:SignedDocumen
   if (job.kind === 'deliverable' && report.artifact) {
     const a = report.artifact;
     if (a.sha256 !== job.artifact?.sha256 || a.manifest.baseCommit !== job.github.baseCommit ||
-      objectHash(a.manifest.repo) !== objectHash({id:report.repo.id,owner:report.repo.owner,name:report.repo.name}) ||
+      objectHash(a.manifest.repo) !== objectHash(report.repo ? {id:report.repo.id,owner:report.repo.owner,name:report.repo.name}:null) ||
       !SHA256.test(a.manifest.patchSha256) || !SHA40.test(a.manifest.headCommit)) throw new Error('Deliverable manifest binding');
     if (report.verdict === 'pass' && (!a.resultTreeSha || !SHA40.test(a.resultTreeSha) ||
       await github.headTree(job.github,a.manifest.headCommit) !== a.resultTreeSha ||
@@ -96,14 +96,15 @@ export async function reviewWorkerReport(deps:RepoReviewDeps,input:SignedDocumen
   } else if (job.kind === 'deliverable' && report.verdict === 'pass') throw new Error('Missing artifact');
   deps.consumeNonce(report.workerId,report.nonce);
   const payloadPolicy = scanPayload(ctx.payload);
-  const checks = [...report.checks,check('payload-policy',payloadPolicy.verdict === 'clean' ? 'pass':
+  const checks = [...report.checks,...fresh.checks.map(c=>({...c,id:'signer-'+c.id})),check('payload-policy',payloadPolicy.verdict === 'clean' ? 'pass':
     payloadPolicy.verdict === 'blocked' ? 'reject':'hold',...(payloadPolicy.reasons ?? []))];
+  for(const c of checks) if(c.verdict !== 'pass' && !c.reasons.length) c.reasons.push(c.id+': '+c.verdict);
   const outcome = decision(checks);
   const expires = Math.min(now+72*3600_000, intake ? Date.parse(String(intake.expiresAt)) : Infinity);
   const body:Record<string,unknown> = {v:1,kind:job.kind === 'repo-intake' ? 'task-intake':'deliverable-review',
     scope:'repository',taskPda:job.taskPda,creator:ctx.creator,jobSpecHash:job.jobSpecHash,
     cluster:ctx.cluster,genesisHash:ctx.genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,
-    policyHash:moderationPolicyHashHex(),scannerHash:bundle,imageDigest:report.imageDigest,repo:repoBinding(report),
+    policyHash:moderationPolicyHashHex(),scannerHash:bundle,imageDigest:report.imageDigest,repo:repoBinding(report) ?? intake?.repo ?? null,
     verdict:outcome === 'pass' ? 'clean':outcome === 'hold' ? 'suspicious':'blocked',
     riskScore:Math.max(payloadPolicy.riskScore,outcome === 'reject' ? 100:outcome === 'hold' ? 60:0),
     categories:payloadPolicy.categories ?? [],reasons:checks.flatMap(c=>c.reasons),
@@ -116,7 +117,8 @@ export async function reviewWorkerReport(deps:RepoReviewDeps,input:SignedDocumen
   return signDocument(body,key);
 }
 function repoBinding(report:Report) {
-  const r = report.repo!;
+  const r = report.repo;
+  if(!r) return null;
   return {id:r.id,owner:r.owner,name:r.name,licenseSpdx:r.licenseSpdx,baseCommit:r.baseCommit,treeSha:r.treeSha,
     allowedPathsHash:objectHash(report.job.github.allowedPaths),maxDiffBytes:report.job.github.maxDiffBytes,
     testCommandHash:objectHash(report.job.github.testCommand)};

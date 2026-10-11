@@ -1,6 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import type { Job } from '../worker/types.js';
+import type { CreatorAuthorization } from './binding.js';
+import type { SignedDocument } from './verdict.js';
+export interface QueueContext { payload: Record<string,unknown>; creator: string; specUri?: string; authenticatedCreator: boolean; creatorAuthorization?: CreatorAuthorization }
+export interface StoredJob { id: string; binding: string; task: string; hash: string; kind: string; job: string; context: string; state: string; worker: string|null; lease: string|null; leaseUntil: number; reviewed: string|null; report: string|null; result: string|null; expires: number }
+
 import { ModerationRejectError } from './errors.js';
 export interface StoredIntake {
     task: string;
@@ -33,6 +40,7 @@ export class AttestationStore {
       CREATE TABLE IF NOT EXISTS spend(id INTEGER PRIMARY KEY, task TEXT, creator TEXT, at INTEGER, lamports INTEGER);
       CREATE TABLE IF NOT EXISTS nonces(creator TEXT, nonce TEXT, at INTEGER, PRIMARY KEY(creator,nonce));
       CREATE TABLE IF NOT EXISTS admissions(id INTEGER PRIMARY KEY, task TEXT, hash TEXT, creator TEXT, at INTEGER);
+      CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, binding TEXT UNIQUE NOT NULL, task TEXT NOT NULL, hash TEXT NOT NULL, kind TEXT NOT NULL, job TEXT NOT NULL, context TEXT NOT NULL, state TEXT NOT NULL, worker TEXT, lease TEXT, leaseUntil INTEGER NOT NULL DEFAULT 0, reviewed TEXT, report TEXT, result TEXT, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at INTEGER, event TEXT, detail TEXT);`);
     }
     get(task: string): StoredIntake | undefined { return this.db.prepare('SELECT * FROM intakes WHERE task=?').get(task) as unknown as StoredIntake | undefined; }
@@ -71,13 +79,15 @@ export class AttestationStore {
             throw e;
         }
     }
-    reserve(task: string, hash: string, creator: string, cost: number, balance: number, limits: SpendLimits, now = Date.now()): void {
+    reserve(task: string, hash: string, creator: string, cost: number, balance: number, limits: SpendLimits, now = Date.now(), queued?: {job: Job; context: QueueContext}): void {
         this.db.exec('BEGIN IMMEDIATE');
         try {
             const prior = this.get(task);
-            if (prior && (prior.state === 'pending' || prior.state === 'reserved' || prior.expires > now))
+            if (prior?.state === 'queued' && (queued || prior.hash !== hash)) throw new ModerationRejectError(409, 'Task already queued.');
+            if (prior && (prior.state === 'pending' || prior.state === 'reserved' || (prior.state !== 'queued' && prior.expires > now)))
                 throw new ModerationRejectError(409, 'Task already reserved.');
             this.admitInside(task, hash, creator, limits, now);
+            if (prior?.state === 'queued') this.db.prepare('DELETE FROM spend WHERE id=(SELECT MAX(id) FROM spend WHERE task=?)').run(task);
             const spend = this.db.prepare('SELECT COALESCE(SUM(lamports),0) AS day, COALESCE(SUM(CASE WHEN at>? THEN lamports ELSE 0 END),0) AS hour FROM spend WHERE at>?').get(now - 3600000, now - 86400000) as {
                 day: number;
                 hour: number;
@@ -85,12 +95,13 @@ export class AttestationStore {
             if (spend.day + cost > limits.dailyLamports || spend.hour + cost > limits.hourlyLamports)
                 throw new ModerationRejectError(429, 'Spend cap exceeded.');
             // Concurrent reserved transactions may not yet be reflected in RPC balance.
-            const outstanding = this.db.prepare("SELECT COALESCE(SUM(lamports),0) AS n FROM spend WHERE task IN (SELECT task FROM intakes WHERE state IN ('reserved','pending'))").get() as {
+            const outstanding = this.db.prepare("SELECT COALESCE(SUM(lamports),0) AS n FROM spend WHERE task<>? AND id IN (SELECT MAX(id) FROM spend GROUP BY task) AND task IN (SELECT task FROM intakes WHERE state IN ('queued','reserved','pending'))").get(task) as {
                 n: number;
             };
             if (balance - cost - outstanding.n < limits.walletFloor)
                 throw new ModerationRejectError(503, 'Wallet floor reached.');
-            this.db.prepare("INSERT OR REPLACE INTO intakes VALUES(?,?,?,'reserved',NULL,?,NULL)").run(task, hash, creator, now + 72 * 3600000);
+            this.db.prepare("INSERT OR REPLACE INTO intakes VALUES(?,?,?,?,NULL,?,NULL)").run(task, hash, creator, queued ? 'queued':'reserved', now + 72 * 3600000);
+            if (queued) this.insertJob(queued.job, queued.context, now);
             this.db.prepare('INSERT INTO spend(task,creator,at,lamports) VALUES(?,?,?,?)').run(task, creator, now, cost);
             this.audit('reserved', { task, hash, creator, cost });
             this.db.exec('COMMIT');
@@ -112,6 +123,41 @@ export class AttestationStore {
         const saved = this.db.prepare(`INSERT INTO intakes VALUES(?,?,?,?,?,?,?) ON CONFLICT(task) DO UPDATE SET hash=excluded.hash,creator=excluded.creator,state=excluded.state,signature=excluded.signature,expires=excluded.expires,result=excluded.result WHERE (intakes.hash=excluded.hash OR intakes.expires<=?) AND intakes.state NOT IN ('reserved','pending')`).run(task, hash, creator, state, attestation?.signature || null, expires, JSON.stringify(result), Date.now());
         if (saved.changes === 0) throw new ModerationRejectError(409, 'One live hash per task.');
         this.audit('verdict', { task, hash, creator });
+    }
+    private insertJob(job: Job, context: QueueContext, now: number): StoredJob {
+        const id = randomUUID(), binding = JSON.stringify([job.kind,job.taskPda,job.jobSpecHash,job.artifact ?? null]);
+        this.db.prepare("INSERT INTO jobs(id,binding,task,hash,kind,job,context,state,expires) VALUES(?,?,?,?,?,?,?,'queued',?)").run(id,binding,job.taskPda,job.jobSpecHash,job.kind,JSON.stringify(job),JSON.stringify(context),now+72*3600000);
+        return this.job(id)!;
+    }
+    job(id: string): StoredJob|undefined { return this.db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as unknown as StoredJob|undefined; }
+    intakeJob(task: string, hash: string): StoredJob|undefined { return this.db.prepare("SELECT * FROM jobs WHERE task=? AND hash=? AND kind='repo-intake' ORDER BY rowid DESC LIMIT 1").get(task,hash) as unknown as StoredJob|undefined; }
+    deliverableJob(task: string, submission: string, artifact: string): StoredJob|undefined {
+        return this.db.prepare('SELECT * FROM jobs WHERE binding=?').get(JSON.stringify(['deliverable',task,this.get(task)?.hash,{sha256:artifact,submissionPda:submission}])) as unknown as StoredJob|undefined;
+    }
+    enqueueDeliverable(job: Job, context: QueueContext, limits: SpendLimits): StoredJob {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+            // Artifact-specific admissions bound scanner work, including failed reviews.
+            this.admitInside(job.taskPda,'deliverable:'+job.artifact!.submissionPda+':'+job.artifact!.sha256,context.creator,limits,Date.now());
+            const result=this.insertJob(job,context,Date.now()); this.db.exec('COMMIT'); return result;
+        } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    }
+    leaseJob(worker: string, now=Date.now()): StoredJob|undefined {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+            const next=this.db.prepare("SELECT id FROM jobs WHERE (state='queued' OR (state='leased' AND leaseUntil<=?)) AND expires>? ORDER BY rowid LIMIT 1").get(now,now) as {id:string}|undefined;
+            if(next) this.db.prepare("UPDATE jobs SET state='leased',worker=?,lease=?,leaseUntil=? WHERE id=?").run(worker,randomBytes(24).toString('hex'),now+15*60000,next.id);
+            this.db.exec('COMMIT'); return next ? this.job(next.id):undefined;
+        } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    }
+    saveReview(id: string, reviewed: SignedDocument, report: unknown): void {
+        this.db.prepare("UPDATE jobs SET state='reviewed',reviewed=?,report=? WHERE id=?").run(JSON.stringify(reviewed),JSON.stringify(report),id);
+    }
+    finishJob(id: string, result: unknown, expires: number): void {
+        this.db.prepare("UPDATE jobs SET state='done',result=?,expires=? WHERE id=?").run(JSON.stringify(result),expires,id);
+    }
+    releaseQueuedSpend(task: string): void {
+        if(this.get(task)?.state === 'queued') this.db.prepare('DELETE FROM spend WHERE id=(SELECT MAX(id) FROM spend WHERE task=?)').run(task);
     }
     close(): void { this.db.close(); }
 }

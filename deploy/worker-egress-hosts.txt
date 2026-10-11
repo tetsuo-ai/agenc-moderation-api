@@ -7,5 +7,9 @@ osv.dev
 api.osv.dev
 # registry_v4/registry_v6; npm is the initial supported install ecosystem.
 registry.npmjs.org
-# Add ONLY the fixed content-addressed artifact registry host configured in
-# worker.json. Do not take additional hosts from job specs, lockfiles or redirects.
+# artifact_v4/artifact_v6: add ONLY the fixed artifact registry host.
+# signer_v4/signer_v6: add ONLY the fixed queueUrl signer TLS host.
+# Populate these distinct sets in worker-egress.nft; do not take hosts from
+# job specs, lockfiles, reports or redirects. Replace the documentation names.
+artifact.example.com
+attestor.example.com

@@ -1,0 +1,222 @@
+/** End-to-end HTTP + durable SQLite + real worker/signatures. Every RPC,
+ * GitHub, registry and container boundary is mocked; no live transactions. */
+import { generateKeyPairSync, sign, verify } from 'node:crypto';
+import { join } from 'node:path';
+import { beforeEach, afterEach, expect, it, vi } from 'vitest';
+import { values } from '@tetsuo-ai/marketplace-sdk';
+import { base58Encode } from '../src/base58.js';
+import { installPayerFixture, installVerdictFixture } from './fixtures.js';
+import { AttestationStore, DEFAULT_SPEND_LIMITS } from '../src/store.js';
+import { documentBytes, keyAddress } from '../src/verdict.js';
+import { creatorRequestBytes } from '../src/binding.js';
+import { moderationPolicyHashBytes } from '../src/policy.js';
+import { scannerHash } from '../worker/rules.js';
+const state=vi.hoisted(()=>({creator:'',moderator:'',hash:'',status:0,workers:0,completions:0,pinned:false,
+ record:null as any,balance:1_000_000_000n,events:[] as string[],timeout:false,subHash:'',subTask:'',subStatus:1,claimWorker:'agent'}));
+vi.mock('@solana/kit',async original=>({...await original<typeof import('@solana/kit')>(),createSolanaRpc:()=>({
+ getGenesisHash:()=>({send:async()=> 'genesis-test'}),
+ getLatestBlockhash:()=>({send:async()=>({value:{blockhash:base58Encode(new Uint8Array(32).fill(7)),lastValidBlockHeight:100n}})}),
+ getFeeForMessage:()=>({send:async()=>({value:5200n})}),
+ getMinimumBalanceForRentExemption:()=>({send:async()=>2519520n}),
+ getBalance:()=>({send:async()=>({value:state.balance})}),
+ sendTransaction:()=>({send:async()=>{state.events.push('send');if(!state.timeout)state.record=record();return 'mock-signature';}}),
+ getSignatureStatuses:()=>({send:async()=>({value:state.timeout?[null]:[{err:null,confirmationStatus:'confirmed'}]})}),
+ getBlockHeight:()=>({send:async()=>1n})
+})}));
+vi.mock('@tetsuo-ai/marketplace-sdk',async original=>({...await original<typeof import('@tetsuo-ai/marketplace-sdk')>(),
+ fetchMaybeTask:async()=>({exists:true,data:{creator:state.creator,status:state.status,currentWorkers:state.workers,completions:state.completions,description:Buffer.from(state.hash,'hex')}}),
+ fetchMaybeTaskJobSpec:async()=>state.pinned?{exists:true,data:{jobSpecHash:Buffer.from(state.hash,'hex'),jobSpecUri:'https://spec.test'}}:{exists:false},
+ fetchMaybeTaskModeration:async()=>state.record?{exists:true,data:state.record}:{exists:false},
+ fetchMaybeModerationConfig:async()=>({exists:true,data:{moderationAuthority:state.moderator}}),
+ fetchMaybeTaskSubmission:async()=>({exists:true,data:{task:state.subTask,claim:TASK,worker:'agent',status:state.subStatus,proofHash:Buffer.from(state.subHash,'hex')}}),
+ fetchMaybeTaskClaim:async()=>({exists:true,data:{task:TASK,worker:state.claimWorker}}),
+ findTaskSubmissionPda:async()=>[SUBMISSION]
+}));
+import { createModerationApi } from '../src/router.js';
+import { type AttestDeps } from '../src/signer.js';
+import { runDevelopmentWorkerOnce } from '../src/repo-queue.js';
+import { __resetRateLimiterForTests } from '../src/rate-limit.js';
+import { processJob, type WorkerDeps } from '../worker/consumer.js';
+import { signQueueRequest, runHttpWorkerOnce } from '../worker/queue-http.js';
+import { signReport } from '../worker/protocol.js';
+import { check, hash, type Report } from '../worker/types.js';
+import type { Sandbox } from '../worker/container.js';
+import { ARTIFACT_BYTES, DIGEST, RESULT_TREE, SPEC, TASK, TREE, cleanTree, entry, github } from './worker-fixtures.js';
+const SUBMISSION=base58Encode(new Uint8Array(32).fill(2));
+const W=generateKeyPairSync('ed25519');
+const PAYLOAD={title:'Fix public repo',custom:{github:SPEC}};
+let fixture:ReturnType<typeof installVerdictFixture>,payer:ReturnType<typeof installPayerFixture>,store:AttestationStore;
+let deps:AttestDeps, handler:ReturnType<typeof createModerationApi>,worker:WorkerDeps,box:ReturnType<typeof sandbox>;
+function sandbox() {
+ return {clone:vi.fn(async()=>({treeSha:TREE,entries:cleanTree()})),
+  apply:vi.fn(async()=>({checks:[check('patch-apply','pass')],snapshot:{treeSha:RESULT_TREE,entries:cleanTree()}})),
+  test:vi.fn(async()=>({exitCode:0 as number|null,timedOut:false,outputSha256:hash('test output')})),close:vi.fn(async()=>{})} satisfies Sandbox;
+}
+function record() { const committedHash=store.get(TASK)?.hash ?? state.hash; return {task:TASK,creator:state.creator,moderator:state.moderator,jobSpecHash:Buffer.from(committedHash,'hex'),
+ status:0,policyHash:moderationPolicyHashBytes(),scannerHash:Buffer.from(scannerHash(DIGEST),'hex'),recordedAt:BigInt(Math.floor(Date.now()/1000)),expiresAt:BigInt(Math.floor(Date.now()/1000)+72*3600)}; }
+function api() { return createModerationApi({storePath:join(fixture.directory,'queue.sqlite'),rateLimitPerIp:1000,rateLimitGlobal:1000},deps); }
+function post(path:string,body:unknown) { return handler(new Request('https://signer.test'+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})); }
+function intake(task=TASK) { return post('/v1/moderation/tasks',{task,jobSpecHash:state.hash,spec:PAYLOAD,specUri:'https://spec.test'}); }
+function transport(path:string,payload:Record<string,unknown>={},key=W.privateKey) { return post(path,signQueueRequest('worker-1',path,payload,key)); }
+function get() { return handler(new Request(`https://signer.test/v1/attestations/${TASK}/${state.hash}`)); }
+function spend() { return store.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(lamports),0) AS total FROM spend').get() as {n:number;total:number}; }
+async function lease() { return (await transport('/internal/worker/pull')).json() as Promise<{jobId:string;leaseToken:string;job:Report['job']}>; }
+async function review(leaseData:Awaited<ReturnType<typeof lease>>,report?:Awaited<ReturnType<typeof processJob>>) {
+ return transport('/internal/worker/reports',{...leaseData,report:report ?? await processJob(leaseData.job,worker)});
+}
+async function acceptedIntake() { expect((await intake()).status).toBe(202);expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);expect((await get()).status).toBe(200); }
+function deliverable() { return post('/v1/moderation/deliverables',{task:TASK,submissionPda:SUBMISSION,artifactSha256:hash(ARTIFACT_BYTES)}); }
+function readySubmission() { state.pinned=true;state.status=2;state.workers=1; }
+beforeEach(async()=>{
+ fixture=installVerdictFixture();payer=installPayerFixture();store=new AttestationStore(join(fixture.directory,'queue.sqlite'));
+ Object.assign(state,{creator:payer.address,moderator:payer.address,hash:(await values.canonicalJobSpecHash(PAYLOAD)).hex,
+  status:0,workers:0,completions:0,pinned:false,record:null,balance:1_000_000_000n,events:[],timeout:false,
+  subHash:hash(ARTIFACT_BYTES),subTask:TASK,subStatus:1,claimWorker:'agent'});
+ deps={rpcUrl:'https://rpc.test',attestationTtlSeconds:72*3600,store,repository:{imageDigest:DIGEST,workers:{'worker-1':keyAddress(W.privateKey)},github:github()}};
+ box=sandbox();worker={workerId:'worker-1',reportKey:W.privateKey,imageDigest:DIGEST,github:github(),sandbox:()=>box,
+  artifactBytes:async()=>ARTIFACT_BYTES,osv:async ds=>({results:ds.map(()=>({}))})};
+ vi.stubGlobal('fetch',vi.fn(async(_url,init)=>{expect(init?.method ?? 'GET').toBe('GET');return new Response(JSON.stringify(PAYLOAD));}));
+ __resetRateLimiterForTests();handler=api();
+});
+afterEach(()=>{store.close();fixture.cleanup();delete process.env.MODERATION_SIGNER_SECRET;delete process.env.CONFIRMATION_TIMEOUT_MS;vi.unstubAllGlobals();});
+it('queues HTTP intake, worker pulls/posts, and returns a verifiable repo-bound V verdict',async()=>{
+ const first=await intake();expect(first.status).toBe(202);expect(await first.json()).toMatchObject({pending:true,jobId:expect.any(String),retryAfterSeconds:5,attested:false});
+ expect((await get()).status).toBe(404);expect(state.events).toEqual([]);
+ const fetcher=(async(input:any,init:any)=>handler(new Request(input,init))) as typeof fetch;
+ expect(await runHttpWorkerOnce('https://signer.test',worker,fetcher)).toBe(true);
+ const done=await (await intake()).json();expect(done.attested).toBe(true);expect(done.signedVerdict.body).toMatchObject({kind:'task-intake',scope:'repository',verdict:'clean',repo:{id:123,owner:SPEC.owner,name:SPEC.repo,licenseSpdx:'MIT',baseCommit:SPEC.baseCommit,treeSha:TREE,allowedPathsHash:expect.any(String),testCommandHash:expect.any(String),maxDiffBytes:SPEC.maxDiffBytes},record:{pda:expect.any(String),txSignature:expect.any(String)}});
+ expect(verify(null,documentBytes(done.signedVerdict.body),fixture.verdict.publicKey,Buffer.from(done.signedVerdict.signature,'hex'))).toBe(true);
+ expect((await (await get()).json()).signedVerdict).toEqual(done.signedVerdict);expect(state.events).toEqual(['send']);expect(spend()).toEqual({n:1,total:2524720});
+ expect(await runHttpWorkerOnce('https://signer.test',worker,fetcher)).toBe(false);
+});
+it.each(['hold','reject'])('stores %s reasons without an on-chain record or spend',async outcome=>{
+ if(outcome==='hold') box.clone.mockRejectedValue(Error('mock sandbox outage'));
+ else box.clone.mockResolvedValue({treeSha:TREE,entries:[...cleanTree(),entry('src/secret','-----BEGIN PRIVATE KEY-----')]});
+ await intake();expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ const res=await intake();expect(res.status).toBe(200);const result=await res.json();
+ expect(result.verdict).toBe(outcome==='hold'?'suspicious':'blocked');expect(result.signedVerdict.body.reasons.length).toBeGreaterThan(0);
+ expect(result.attestation).toBeNull();expect(result.signedVerdict.body.record.pda).toBeNull();expect((await get()).status).toBe(200);
+ expect(state.events).toEqual([]);expect(spend()).toEqual({n:0,total:0});
+});
+it('rejects forged transport, domain substitution, replay and forged worker reports',async()=>{
+ await intake();expect((await transport('/internal/worker/pull',{},payer.privateKey)).status).toBe(403);
+ const auth=signQueueRequest('worker-1','/internal/worker/pull',{},W.privateKey);
+ const pulled=await post('/internal/worker/pull',auth);expect(pulled.status).toBe(200);
+ expect((await post('/internal/worker/pull',auth)).status).toBe(409);
+ expect((await post('/internal/worker/reports',auth)).status).toBe(403);
+ const l=await pulled.json();const r=await processJob(l.job,worker);r.signature='00'.repeat(64);
+ expect((await review(l,r)).status).toBe(403);expect((await get()).status).toBe(404);expect(state.events).toEqual([]);
+});
+it('rejects a signed report whose job, image or required checks are forged',async()=>{
+ await intake();const l=await lease();const original=await processJob(l.job,worker);
+ for(const body of [{...original.body,imageDigest:'sha256:'+'f'.repeat(64)},
+  {...original.body,job:{...original.body.job,taskPda:SUBMISSION}},
+  {...original.body,checks:original.body.checks.filter(c=>c.id!=='secrets')}]) {
+  expect((await review(l,signReport(body,W.privateKey))).status).toBeGreaterThanOrEqual(400);
+ }
+ expect(state.events).toEqual([]);expect(store.job(l.jobId)?.reviewed).toBeNull();
+});
+it('retries intake/report idempotently without extra quota or spend',async()=>{
+ const first=await (await intake()).json();const retry=await (await intake()).json();expect(retry.jobId).toBe(first.jobId);expect(spend().n).toBe(1);
+ const l=await lease(),r=await processJob(l.job,worker);expect((await review(l,r)).status).toBe(200);
+ expect((await review(l,r)).status).toBe(200);expect((await intake()).status).toBe(200);expect(state.events).toEqual(['send']);expect(spend().n).toBe(1);
+ expect(store.db.prepare('SELECT COUNT(*) AS n FROM admissions').get()).toEqual({n:1});
+});
+it('persists queue and leases across restart and refuses an obsolete lease',async()=>{
+ await intake();const old=await lease();const path=join(fixture.directory,'queue.sqlite');store.close();store=new AttestationStore(path);deps.store=store;handler=api();
+ expect((await intake()).status).toBe(202);expect((await transport('/internal/worker/pull')).status).toBe(204);
+ store.db.prepare('UPDATE jobs SET leaseUntil=0').run();const fresh=await lease();expect(fresh.jobId).toBe(old.jobId);expect(fresh.leaseToken).not.toBe(old.leaseToken);
+ expect((await review(old)).status).toBe(409);expect((await review(fresh)).status).toBe(200);expect((await get()).status).toBe(200);expect(spend().n).toBe(1);
+});
+it('resumes an ambiguous chain submission from the stored report without resending',async()=>{
+ state.timeout=true;process.env.CONFIRMATION_TIMEOUT_MS='0';await intake();await runDevelopmentWorkerOnce(deps,worker);
+ expect((await intake()).status).toBe(202);expect((await get()).status).toBe(404);expect(state.events).toEqual(['send']);
+ state.record=record();const done=await intake();expect(done.status).toBe(200);expect(state.events).toEqual(['send']);expect(spend().n).toBe(1);
+});
+it.each(['hour','day','floor','quota'])('enforces %s guard before admitting worker jobs',async guard=>{
+ deps.spendLimits={...DEFAULT_SPEND_LIMITS};
+ if(guard==='hour')deps.spendLimits.hourlyLamports=1;if(guard==='day')deps.spendLimits.dailyLamports=1;
+ if(guard==='floor')state.balance=100_000_000n;if(guard==='quota')deps.spendLimits.dailyIntakes=0;
+ handler=api();expect((await intake()).status).toBe(guard==='floor'?503:429);
+ expect(store.intakeJob(TASK,state.hash)).toBeUndefined();expect(spend().n).toBe(0);expect(state.events).toEqual([]);
+});
+it('bounds concurrent queued reservations and counts held jobs against quota',async()=>{
+ deps.spendLimits={...DEFAULT_SPEND_LIMITS,dailyIntakes:1};handler=api();await intake();
+ expect((await intake(SUBMISSION)).status).toBe(429);
+ box.clone.mockRejectedValue(Error('outage'));await runDevelopmentWorkerOnce(deps,worker);
+ expect((await intake(SUBMISSION)).status).toBe(429);expect(spend().n).toBe(0);
+});
+it('refuses task/spec/creator changes during signer rechecks',async()=>{
+ await intake();const l=await lease(),report=await processJob(l.job,worker);state.workers=1;
+ expect((await review(l,report)).status).toBe(409);expect(state.events).toEqual([]);expect((await get()).status).toBe(404);
+});
+it('runs deliverable review through the queue and binds submission/artifact/intake',async()=>{
+ await acceptedIntake();readySubmission();const first=await deliverable();expect(first.status).toBe(202);
+ const body=await first.json();expect((await (await deliverable()).json()).jobId).toBe(body.jobId);
+ expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);const done=await deliverable();expect(done.status).toBe(200);
+ const result=await done.json();expect(result.signedVerdict.body).toMatchObject({kind:'deliverable-review',scope:'repository',verdict:'clean',submissionPda:SUBMISSION,artifactSha256:hash(ARTIFACT_BYTES),resultTreeSha:RESULT_TREE,intakeHash:expect.any(String),tests:{exitCode:0}});
+ expect(verify(null,documentBytes(result.signedVerdict.body),fixture.verdict.publicKey,Buffer.from(result.signedVerdict.signature,'hex'))).toBe(true);
+ expect((await handler(new Request(`https://signer.test/v1/deliverable-reviews/${TASK}/${SUBMISSION}/${hash(ARTIFACT_BYTES)}`))).status).toBe(200);
+ expect(state.events).toEqual(['send']);expect(spend().n).toBe(1);
+});
+it('stores a failed deliverable and never sends another chain transaction',async()=>{
+ await acceptedIntake();readySubmission();box.test.mockResolvedValue({exitCode:1,timedOut:false,outputSha256:hash('failed')});
+ await deliverable();await runDevelopmentWorkerOnce(deps,worker);const result=await (await deliverable()).json();
+ expect(result.signedVerdict.body.verdict).toBe('blocked');expect(result.signedVerdict.body.reasons.length).toBeGreaterThan(0);expect(state.events).toEqual(['send']);expect(spend().n).toBe(1);
+});
+it.each(['hash','task','status','claim'])('rejects deliverable submission %s mismatch before enqueue',async mode=>{
+ await acceptedIntake();readySubmission();if(mode==='hash')state.subHash='0'.repeat(64);if(mode==='task')state.subTask=SUBMISSION;if(mode==='status')state.subStatus=2;if(mode==='claim')state.claimWorker='other';
+ expect((await deliverable()).status).toBe(409);expect(store.db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE kind='deliverable'").get()).toEqual({n:0});
+});
+it('requires accepted intake and caps deliverable scanner admissions',async()=>{
+ await acceptedIntake();readySubmission();deps.spendLimits={...DEFAULT_SPEND_LIMITS,dailyIntakes:1};handler=api();
+ expect((await deliverable()).status).toBe(429);expect(state.events).toEqual(['send']);
+});
+
+it.each(['hold','reject'])('stores negative GitHub %s reports even without immutable repo facts',async outcome=>{
+ const negative=outcome==='hold' ? github(()=>{throw Error('GitHub offline');}) : github(url=>url.includes('/license?')?{license:{spdx_id:'GPL-3.0'}}:undefined);
+ deps.repository!.github=negative;worker.github=negative;handler=api();await intake();await runDevelopmentWorkerOnce(deps,worker);
+ const done=await (await get()).json();expect(done.verdict).toBe(outcome==='hold'?'suspicious':'blocked');expect(done.signedVerdict.body.repo).toBeNull();
+ expect(done.signedVerdict.body.reasons.length).toBeGreaterThan(0);expect(spend().n).toBe(0);expect(state.events).toEqual([]);
+});
+it('reuses the originally admitted creator authorization and checks the current creator',async()=>{
+ const target=state.hash;state.hash='a'.repeat(64);
+ const auth={issuedAt:new Date().toISOString(),nonce:'ab'.repeat(16)};
+ const creatorAuthorization={...auth,signature:sign(null,creatorRequestBytes(payer.address,TASK,target,auth),payer.privateKey).toString('hex')};
+ const body={task:TASK,jobSpecHash:target,spec:PAYLOAD,creatorAuthorization};
+ const first=await post('/v1/moderation/tasks',body);expect(first.status).toBe(202);
+ expect((await post('/v1/moderation/tasks',body)).status).toBe(202);
+ // R completion uses the admitted wallet proof rather than the description.
+ await runDevelopmentWorkerOnce(deps,worker);
+ expect((await post('/v1/moderation/tasks',body)).status).toBe(200);expect(spend().n).toBe(1);expect(state.events).toEqual(['send']);
+});
+it('keeps queued reservations in the aggregate spend cap',async()=>{
+ deps.spendLimits={...DEFAULT_SPEND_LIMITS,hourlyLamports:4_000_000};handler=api();expect((await intake()).status).toBe(202);
+ expect((await intake(SUBMISSION)).status).toBe(429);expect(spend()).toEqual({n:1,total:2619520});
+});
+it('keeps one live hash while a repository worker job is pending',async()=>{
+ await intake();const other={...PAYLOAD,title:'Different work'};const otherHash=(await values.canonicalJobSpecHash(other)).hex;state.hash=otherHash;
+ expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:otherHash,spec:other})).status).toBe(409);expect(spend().n).toBe(1);
+});
+it('preserves a reviewed report when retrievability fails and resumes on Desktop retry',async()=>{
+ await intake();const l=await lease(),r=await processJob(l.job,worker);
+ vi.stubGlobal('fetch',vi.fn(async()=>new Response('{}',{status:404})));
+ expect((await review(l,r)).status).toBe(200);expect(store.job(l.jobId)?.state).toBe('reviewed');expect((await get()).status).toBe(404);expect(state.events).toEqual([]);
+ vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify(PAYLOAD))));
+ expect((await intake()).status).toBe(200);expect(state.events).toEqual(['send']);expect(spend().n).toBe(1);
+});
+it('releases the queue budget when reusing an existing valid chain record',async()=>{
+ await intake();state.record=record();await runDevelopmentWorkerOnce(deps,worker);
+ expect((await get()).status).toBe(200);expect(state.events).toEqual([]);expect(spend().n).toBe(0);
+});
+it('recovers a deliverable review journaled immediately before a crash',async()=>{
+ await acceptedIntake();readySubmission();await deliverable();await runDevelopmentWorkerOnce(deps,worker);
+ store.db.prepare("UPDATE jobs SET state='reviewed',result=NULL WHERE kind='deliverable'").run();
+ const done=await deliverable();expect(done.status).toBe(200);expect((await done.json()).signedVerdict.body.kind).toBe('deliverable-review');expect(state.events).toEqual(['send']);
+});
+it('keeps development worker execution disabled in production',async()=>{
+ const old=process.env.NODE_ENV;process.env.NODE_ENV='production';
+ try { await expect(runDevelopmentWorkerOnce(deps,worker)).rejects.toThrow('forbidden'); }
+ finally { process.env.NODE_ENV=old; }
+ expect(box.clone).not.toHaveBeenCalled();
+});
