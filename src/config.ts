@@ -1,14 +1,13 @@
-/**
- * Environment-driven service configuration. Everything has a safe default so a
- * self-hoster can boot with nothing but a signer key; every knob is disclosed
- * (minus secrets) at `GET /v1/info`.
- */
+/** Non-secret environment configuration for the single-host attestor. */
 
 import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
 
 export interface ServiceConfig {
   /** Solana RPC endpoint the service reads state from and sends attest txs to. */
   rpcUrl: string;
+  pinEnabled: boolean;
+  storePath: string;
+  spendLimits: import('./store.js').SpendLimits;
   /** Human label for the cluster (info/reporting only; the RPC is the truth). */
   cluster: string;
   /**
@@ -17,16 +16,9 @@ export interface ServiceConfig {
    * this service. Default: the official marketplace registry.
    */
   jobSpecRegistryUrl: string;
-  /**
-   * Optional operator write token for registry pins (Authorization: Bearer).
-   * When unset, pins fall back to wallet-scoped upload tickets signed by the
-   * moderation signer key (an off-chain signature — no transaction).
-   */
+  /** Operator token for explicitly enabled, creator-authenticated pins. */
   jobSpecRegistryToken: string | null;
-  /**
-   * Attestation TTL in seconds. `expires_at = recordedAt + ttl`; 0 disables
-   * expiry (matches the historical first-party behavior). Default 30 days.
-   */
+  /** Fixed 72-hour intake TTL. */
   attestationTtlSeconds: number;
   /**
    * Optional bearer API keys. When non-empty, POST endpoints require
@@ -61,18 +53,18 @@ function nonEmpty(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-export const DEFAULT_ATTESTATION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+export const DEFAULT_ATTESTATION_TTL_SECONDS = 72 * 60 * 60; // 72 hours
 
 export function loadConfig(): ServiceConfig {
   return {
+    pinEnabled: process.env.ENABLE_SPEC_PINNING === '1',
+    storePath: process.env.ATTESTATION_DB_PATH ?? './data/attestations.sqlite',
+    spendLimits: {hourlyLamports:intEnv('SPEND_HOURLY_LAMPORTS',30_000_000),dailyLamports:intEnv('SPEND_DAILY_LAMPORTS',150_000_000),dailyIntakes:intEnv('CREATOR_DAILY_INTAKES',20),hourlyTasks:intEnv('CREATOR_HOURLY_TASKS',5),walletFloor:intEnv('WALLET_FLOOR_LAMPORTS',100_000_000)},
     rpcUrl: nonEmpty(process.env.RPC_URL) ?? "https://api.mainnet-beta.solana.com",
     cluster: nonEmpty(process.env.CLUSTER_LABEL) ?? "mainnet",
     jobSpecRegistryUrl: nonEmpty(process.env.JOB_SPEC_REGISTRY_URL) ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
     jobSpecRegistryToken: nonEmpty(process.env.JOB_SPEC_REGISTRY_TOKEN),
-    attestationTtlSeconds: intEnv(
-      "ATTESTATION_TTL_SECONDS",
-      DEFAULT_ATTESTATION_TTL_SECONDS,
-    ),
+    attestationTtlSeconds: DEFAULT_ATTESTATION_TTL_SECONDS,
     apiKeys: (process.env.ATTEST_API_KEYS ?? "")
       .split(",")
       .map((k) => k.trim())

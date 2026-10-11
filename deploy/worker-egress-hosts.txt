@@ -1,0 +1,11 @@
+# DNS refresh allowlist; sets must never receive private/link-local addresses.
+# github_v4/github_v6
+github.com
+api.github.com
+# osv_v4/osv_v6 (OSV batch API lives at api.osv.dev)
+osv.dev
+api.osv.dev
+# registry_v4/registry_v6; npm is the initial supported install ecosystem.
+registry.npmjs.org
+# Add ONLY the fixed content-addressed artifact registry host configured in
+# worker.json. Do not take additional hosts from job specs, lockfiles or redirects.

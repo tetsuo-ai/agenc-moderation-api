@@ -1,3 +1,4 @@
+import { clientIp } from '../src/rate-limit.js';
 import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it } from "vitest";
@@ -6,6 +7,7 @@ import { nodeRequestToWeb } from "../src/node-adapter.js";
 /** Build a fake IncomingMessage streaming `chunks` with the given method/headers. */
 function fakeReq(method: string, chunks: Buffer[], headers: Record<string, string> = {}): IncomingMessage {
   const readable = Readable.from(chunks) as unknown as IncomingMessage;
+  Object.defineProperty(readable,"socket",{value:{remoteAddress:"198.51.100.4"}});
   readable.method = method;
   readable.url = "/v1/moderation/tasks";
   readable.headers = { host: "svc.test", ...headers };
@@ -33,4 +35,10 @@ describe("nodeRequestToWeb stream cap (self-host OOM guard)", () => {
     expect(new URL(request.url).pathname).toBe("/v1/moderation/tasks");
     expect(request.method).toBe("GET");
   });
+});
+
+it('uses the socket address despite every forged IP header',()=>{
+  delete process.env.TRUST_PROXY;
+  const req=nodeRequestToWeb(fakeReq('GET',[],{'x-forwarded-for':'1.2.3.4','x-real-ip':'8.8.8.8','x-vercel-forwarded-for':'9.9.9.9'}));
+  expect(clientIp(req)).toBe('198.51.100.4');
 });

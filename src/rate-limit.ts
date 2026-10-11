@@ -1,3 +1,4 @@
+import { socketIp } from './node-adapter.js';
 /**
  * Fixed-window rate limiter: a strict per-IP bound PLUS a GLOBAL ceiling — the
  * real economic bound on the hot moderation key, which signs + pays a mainnet
@@ -166,17 +167,11 @@ export async function rateLimit(config: ServiceConfig, ip: string): Promise<Rate
  * untrusted network the global ceiling remains the backstop.
  */
 export function clientIp(request: Request): string {
-  const platform =
-    request.headers.get("x-vercel-forwarded-for")?.trim() ||
-    request.headers.get("x-real-ip")?.trim();
-  if (platform) return platform;
-  const fwd = request.headers.get("x-forwarded-for");
-  if (fwd) {
-    const hops = fwd.split(",").map((h) => h.trim()).filter(Boolean);
-    const rightmost = hops[hops.length - 1];
-    if (rightmost) return rightmost;
+  if(process.env.TRUST_PROXY === '1') {
+    const ip = request.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim();
+    if(ip) return ip;
   }
-  return "unknown";
+  return socketIp(request) ?? 'unknown';
 }
 
 /** Test hook. */

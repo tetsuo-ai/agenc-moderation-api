@@ -74,6 +74,7 @@ function isPublicIPv4(ip: string): boolean {
   if (a === 172 && b >= 16 && b <= 31) return false; // 172.16/12 private
   if (a === 192 && b === 0 && octets[2] === 0) return false; // 192.0.0/24 special
   if (a === 192 && b === 0 && octets[2] === 2) return false; // 192.0.2/24 TEST-NET-1
+  if (a === 192 && b === 88 && octets[2] === 99) return false; // deprecated relay
   if (a === 192 && b === 168) return false; // 192.168/16 private
   if (a === 198 && (b === 18 || b === 19)) return false; // 198.18/15 benchmarking
   if (a === 198 && b === 51 && octets[2] === 100) return false; // TEST-NET-2
@@ -140,6 +141,9 @@ function isPublicIPv6(ip: string): boolean {
   if (allZeroThrough(15) && (bytes[15] === 0 || bytes[15] === 1)) return false;
   if (bytes[0] === 0xff) return false; // ff00::/8 multicast
   if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return false; // fe80::/10 link-local
+  if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0xc0) return false; // fec0::/10
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0 && bytes[3] === 0) return false; // Teredo
+  if (bytes[0] === 0x20 && bytes[1] === 0x02) return false; // 6to4
   if ((bytes[0] & 0xfe) === 0xfc) return false; // fc00::/7 ULA
   if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0d && bytes[3] === 0xb8) {
     return false; // 2001:db8::/32 documentation

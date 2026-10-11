@@ -1,37 +1,7 @@
-/**
- * Retrievability gate: EVERY ATTESTATION IMPLIES RETRIEVABLE CONTENT.
- *
- * Incident this closes: a creator sent this service full job-spec bytes,
- * received a valid CLEAN on-chain TaskModeration attestation (the hash binding
- * is fail-closed at scan time), then never hosted the bytes anywhere. The task
- * pinned a bare `agenc://job-spec/sha256/<hash>` pointer; workers claimed it
- * and could never retrieve the spec — the service is stateless and had
- * discarded the only copy it ever saw.
- *
- * Before recording an on-chain attestation the service now establishes that a
- * retrievable copy of the exact content exists, by the FIRST of:
- *
- *  1. ALREADY RETRIEVABLE — GET `<registry>/api/job-specs/<hash>` returns 200
- *     with hash-matching content (`JOB_SPEC_REGISTRY_URL`, default the
- *     official marketplace registry). This is the agenc.ag / kit
- *     `tasks create-reviewed-public` shape, which always publishes first.
- *  2. RETRIEVABLE AT THE CALLER'S URI — an https `specUri` (or the on-chain
- *     spec/job-spec URI) serves bytes that hash-match. UNTRUSTED INPUT: fetched
- *     only through the SSRF-guarded pinned-address fetcher.
- *  3. PIN IT OURSELVES — when the caller handed us the full payload, publish
- *     it to the registry via PUT `<registry>/api/job-specs/<hash>` using the
- *     same envelope + write authorization the kit uses (operator
- *     `JOB_SPEC_REGISTRY_TOKEN`, or a wallet-scoped upload ticket minted at
- *     POST `<registry>/api/job-spec-upload-tickets` with an off-chain
- *     signature from the moderation signer key).
- *
- * If none succeed we REFUSE to attest ({@link SpecNotRetrievableError},
- * HTTP 409, `code: SPEC_NOT_RETRIEVABLE`, retryable) — only publish-nothing
- * callers (the incident shape) are blocked.
- */
+/** Hash-bound retrievability. Optional registry pins require creator auth and operator token. */
 
 import { createHash } from "node:crypto";
-import { createSignableMessage, type TransactionSigner } from "@solana/kit";
+import { type TransactionSigner } from "@solana/kit";
 import { values } from "@tetsuo-ai/marketplace-sdk";
 import { fetchJobSpecBody } from "./ssrf-fetch.js";
 import { SpecNotRetrievableError } from "./errors.js";
@@ -185,101 +155,6 @@ async function contentMatchesHash(text: string, target: string): Promise<boolean
   }
 }
 
-/** Structural check: can this signer sign off-chain (upload-ticket) messages? */
-interface MessageSigning {
-  address: string;
-  signMessages(
-    messages: readonly ReturnType<typeof createSignableMessage>[],
-  ): Promise<readonly Readonly<Record<string, Uint8Array>>[]>;
-}
-
-function messageSigning(signer: TransactionSigner | null): MessageSigning | null {
-  if (
-    signer &&
-    typeof (signer as unknown as { signMessages?: unknown }).signMessages === "function"
-  ) {
-    return signer as unknown as MessageSigning;
-  }
-  return null;
-}
-
-/**
- * Mint a hash-scoped wallet upload ticket the way the kit does: sign the
- * canonical off-chain message with the moderation signer key and exchange it
- * at the registry's ticket endpoint. Off-chain signature only — no SOL moves,
- * no transaction is signed.
- */
-async function mintUploadTicket(params: {
-  registryUrl: string;
-  targetHashHex: string;
-  signer: MessageSigning;
-  fetchImpl: typeof fetch;
-}): Promise<{ header: string; ticket: string } | { failed: string }> {
-  const issuedAt = new Date().toISOString();
-  const message = [
-    "AgenC job-spec upload ticket v1",
-    `authority=${params.signer.address}`,
-    "agentPda=",
-    `jobSpecHash=${params.targetHashHex}`,
-    `issuedAt=${issuedAt}`,
-  ].join("\n");
-  let signatureHex: string;
-  try {
-    const [signatures] = await params.signer.signMessages([
-      createSignableMessage(Buffer.from(message, "utf8")),
-    ]);
-    const signature = signatures?.[params.signer.address];
-    if (!(signature instanceof Uint8Array)) throw new Error("no signature");
-    signatureHex = Buffer.from(signature).toString("hex");
-  } catch {
-    return { failed: "the moderation signer could not sign the upload-ticket message" };
-  }
-
-  let response: Response;
-  try {
-    response = await params.fetchImpl(jobSpecUploadTicketUrl(params.registryUrl), {
-      method: "POST",
-      redirect: "manual",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        ...hostedEntitlementHeaders(),
-      },
-      body: JSON.stringify({
-        authority: params.signer.address,
-        jobSpecHash: params.targetHashHex,
-        issuedAt,
-        signature: signatureHex,
-        message,
-      }),
-      signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
-    });
-  } catch {
-    return { failed: "the registry upload-ticket endpoint was unreachable" };
-  }
-  let body: Record<string, unknown>;
-  try {
-    const parsed: unknown = JSON.parse(await readRegistryBody(response));
-    body = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    body = {};
-  }
-  if (!response.ok) {
-    return { failed: `the registry refused an upload ticket (HTTP ${response.status})` };
-  }
-  const ticket = typeof body.ticket === "string" ? body.ticket : "";
-  const echoedHash = typeof body.jobSpecHash === "string" ? body.jobSpecHash.toLowerCase() : "";
-  const header =
-    typeof body.header === "string" && SAFE_HEADER_NAME_RE.test(body.header)
-      ? body.header
-      : "x-agenc-job-spec-upload-ticket";
-  if (!ticket || echoedHash !== params.targetHashHex) {
-    return { failed: "the registry upload-ticket response was malformed or hash-mismatched" };
-  }
-  return { header, ticket };
-}
-
 /**
  * Path 3: publish the payload to the registry ourselves. Only possible when
  * the declared hash IS the canonical json-stable-v1 payload hash (the registry
@@ -328,26 +203,8 @@ async function tryPinToRegistry(params: {
     "content-type": "application/json; charset=utf-8",
     ...hostedEntitlementHeaders(),
   };
-  if (params.registryToken) {
-    headers.authorization = `Bearer ${params.registryToken}`;
-  } else {
-    const signer = messageSigning(params.moderator);
-    if (!signer) {
-      return {
-        failed:
-          "pin skipped: no registry write credential (set JOB_SPEC_REGISTRY_TOKEN) and the " +
-          "moderation signer cannot mint a wallet upload ticket",
-      };
-    }
-    const ticket = await mintUploadTicket({
-      registryUrl: params.registryUrl,
-      targetHashHex: params.targetHashHex,
-      signer,
-      fetchImpl: params.fetchImpl,
-    });
-    if ("failed" in ticket) return ticket;
-    headers[ticket.header] = ticket.ticket;
-  }
+  if (!params.registryToken) return { failed: 'Operator token required' };
+  headers.authorization = `Bearer ${params.registryToken}`;
 
   let response: Response;
   try {
@@ -386,6 +243,8 @@ async function tryPinToRegistry(params: {
 }
 
 export interface EnsureSpecRetrievableParams {
+  pinEnabled?: boolean;
+  authenticatedCreator?: boolean;
   /** Registry base URL (operator-configured, trusted). */
   registryUrl: string;
   /** Operator registry write token, when provisioned (else wallet tickets). */
@@ -467,6 +326,9 @@ export async function ensureSpecRetrievable(
     }
   }
 
+  if (!params.pinEnabled || !params.authenticatedCreator || !params.registryToken) {
+    throw new SpecNotRetrievableError('SPEC_NOT_RETRIEVABLE: pinning disabled or unauthorized.');
+  }
   // 3. Pin it ourselves — the caller handed us the payload; host it for them.
   const pin = await tryPinToRegistry({
     registryUrl: params.registryUrl,

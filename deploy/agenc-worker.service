@@ -1,0 +1,51 @@
+[Unit]
+Description=AgenC repository report worker (separate scanner droplet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agenc-worker
+Group=agenc-worker
+WorkingDirectory=/opt/agenc-attestor
+ExecStart=/usr/bin/node /opt/agenc-attestor/dist/worker.js /etc/agenc-worker/worker.json
+Environment=NODE_ENV=production HOME=/var/lib/agenc-worker
+Environment=REPORT_KEY_FILE=%d/report.pem
+LoadCredentialEncrypted=report.pem:/etc/credstore.encrypted/agenc-worker-report.pem
+# Queue bridge supplies bounded JSONL into this FIFO and journals stdout reports.
+# It acknowledges a lease only after report verification and durable storage.
+StandardInput=file:/var/lib/agenc-worker/jobs.fifo
+StandardOutput=append:/var/lib/agenc-worker/reports.jsonl
+StandardError=journal
+StateDirectory=agenc-worker
+StateDirectoryMode=0700
+RuntimeDirectory=agenc-worker
+RuntimeDirectoryMode=0700
+# Replace 1002 with the same dedicated worker UID as the nftables template.
+# Provision this private user runtime directory before starting the unit.
+ReadWritePaths=/run/user/1002
+UMask=0077
+Restart=on-failure
+RestartSec=10
+Delegate=true
+# Rootless Podman needs its mapping helpers/user namespaces. Do not copy the
+# signer unit's NoNewPrivileges/namespace restrictions onto this controller.
+# Each *scanner container* independently drops all caps and gains no privileges.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+TasksMax=256
+MemoryMax=1536M
+CPUQuota=100%
+LimitNOFILE=4096
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

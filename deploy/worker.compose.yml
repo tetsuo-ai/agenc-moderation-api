@@ -1,0 +1,31 @@
+# Scanner image qualification template, NOT the worker controller. The worker
+# unit operates rootless Podman directly; no engine socket is mounted anywhere.
+# Pin SCANNER_IMAGE to the tested image digest before operator use.
+services:
+  scanner-offline:
+    image: ${SCANNER_IMAGE:?digest-pinned scanner image required}
+    pull_policy: never
+    profiles: [qualification]
+    network_mode: none
+    read_only: true
+    user: "65534:65534"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /work:rw,nosuid,nodev,size=536870912,uid=65534,gid=65534,mode=0700
+      - /tmp:rw,noexec,nosuid,nodev,size=16777216,mode=1777
+    working_dir: /work
+    pids_limit: 128
+    mem_limit: 768m
+    memswap_limit: 768m
+    cpus: 1
+    ulimits:
+      nofile: {soft: 1024, hard: 1024}
+    environment:
+      HOME: /work
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_LFS_SKIP_SMUDGE: "1"
+    entrypoint: [node]
+    command: ["-e", "process.stdout.write('offline scanner image qualification only\\n')"]

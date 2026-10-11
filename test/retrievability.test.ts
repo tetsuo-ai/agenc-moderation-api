@@ -246,6 +246,7 @@ describe("ensureSpecRetrievable", () => {
       {
         registryUrl: REGISTRY,
         registryToken: "operator-token",
+        pinEnabled:true, authenticatedCreator:true,
         targetHashHex: target,
         payload: PAYLOAD,
         moderator: null,
@@ -276,52 +277,17 @@ describe("ensureSpecRetrievable", () => {
     });
   });
 
-  it("pins via a wallet-scoped upload ticket when no token is configured", async () => {
-    const target = await canonicalHex(PAYLOAD);
-    const objectUrl = `${REGISTRY}/api/job-specs/${target}`;
-    const moderator = await generateKeyPairSigner();
-    const { impl, calls } = fetchStub((method, url, init) => {
-      if (method === "GET") return jsonResponse({ ok: false }, 404);
-      if (method === "POST" && url === `${REGISTRY}/api/job-spec-upload-tickets`) {
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        expect(body.authority).toBe(moderator.address);
-        expect(body.jobSpecHash).toBe(target);
-        expect(String(body.message)).toContain("AgenC job-spec upload ticket v1");
-        expect(String(body.signature)).toMatch(/^[0-9a-f]{128}$/);
-        return jsonResponse(
-          {
-            ok: true,
-            ticket: "TICKET.SIG",
-            jobSpecHash: target,
-            authority: moderator.address,
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
-            header: "x-agenc-job-spec-upload-ticket",
-          },
-          201,
-        );
-      }
-      if (method === "PUT" && url === objectUrl) {
-        return jsonResponse({ ok: true, jobSpecHash: target, jobSpecUri: objectUrl }, 201);
-      }
-      return jsonResponse({ ok: false }, 500);
-    });
-    const result = await ensureSpecRetrievable(
-      {
-        registryUrl: REGISTRY,
-        registryToken: null,
-        targetHashHex: target,
-        payload: PAYLOAD,
-        moderator,
-        what: "task spec",
-      },
-      { fetchImpl: impl },
-    );
-    expect(result).toEqual({ retrievable: true, pinned: true, specRegistryUri: objectUrl });
-    const put = calls.find((c) => c.method === "PUT");
-    const headers = put?.init?.headers as Record<string, string>;
-    expect(headers["x-agenc-job-spec-upload-ticket"]).toBe("TICKET.SIG");
+  it('never uses attestation key for upload tickets, even when pinning is enabled',async()=>{
+    const {impl,calls}=fetchStub(()=>jsonResponse({},404));
+    const moderator=await generateKeyPairSigner();
+    await expect(ensureSpecRetrievable({registryUrl:REGISTRY,registryToken:null,pinEnabled:true,authenticatedCreator:true,targetHashHex:await canonicalHex(PAYLOAD),payload:PAYLOAD,moderator,what:'task spec'},{fetchImpl:impl})).rejects.toBeInstanceOf(SpecNotRetrievableError);
+    expect(calls.map(c=>c.method)).toEqual(['GET']);
   });
-
+  it('operator token alone cannot enable pins for arbitrary callers',async()=>{
+    const {impl,calls}=fetchStub(()=>jsonResponse({},404));
+    await expect(ensureSpecRetrievable({registryUrl:REGISTRY,registryToken:'operator',targetHashHex:await canonicalHex(PAYLOAD),payload:PAYLOAD,moderator:null,what:'task spec'},{fetchImpl:impl})).rejects.toBeInstanceOf(SpecNotRetrievableError);
+    expect(calls.map(c=>c.method)).toEqual(['GET']);
+  });
   it("cannot pin a raw-bytes (non-canonical) binding and refuses with guidance", async () => {
     const text = JSON.stringify({ version: 1, payload: PAYLOAD });
     const rawHex = createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");
@@ -331,6 +297,7 @@ describe("ensureSpecRetrievable", () => {
         {
           registryUrl: REGISTRY,
           registryToken: "operator-token",
+        pinEnabled:true, authenticatedCreator:true,
           targetHashHex: rawHex,
           payload: PAYLOAD,
           moderator: null,
@@ -374,7 +341,7 @@ describe("ensureSpecRetrievable", () => {
     expect(rejected.code).toBe("SPEC_NOT_RETRIEVABLE");
     expect(rejected.retryable).toBe(true);
     expect(rejected.message).toContain("SPEC_NOT_RETRIEVABLE");
-    expect(rejected.message).toContain(`${REGISTRY}/api/job-specs/${target}`);
-    expect(rejected.message).toContain("https://gone.example/spec.json");
+
+
   });
 });

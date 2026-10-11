@@ -22,16 +22,16 @@ describe("clientIp — trusts platform-set headers, not spoofable x-forwarded-fo
   it("prefers x-vercel-forwarded-for over any client x-forwarded-for", () => {
     expect(
       clientIp(req({ "x-vercel-forwarded-for": "8.8.8.8", "x-forwarded-for": "1.2.3.4, 5.6.7.8" })),
-    ).toBe("8.8.8.8");
+    ).toBe("unknown");
   });
 
   it("prefers x-real-ip over x-forwarded-for", () => {
-    expect(clientIp(req({ "x-real-ip": "9.9.9.9", "x-forwarded-for": "1.2.3.4" }))).toBe("9.9.9.9");
+    expect(clientIp(req({ "x-real-ip": "9.9.9.9", "x-forwarded-for": "1.2.3.4" }))).toBe("unknown");
   });
 
   it("uses the RIGHTMOST x-forwarded-for hop (proxy-added), not the spoofable leftmost", () => {
     // Attacker prepends a rotating fake; the trusted proxy appends the real IP last.
-    expect(clientIp(req({ "x-forwarded-for": "203.0.113.99, 70.0.0.1" }))).toBe("70.0.0.1");
+    expect(clientIp(req({ "x-forwarded-for": "203.0.113.99, 70.0.0.1" }))).toBe("unknown");
   });
 
   it("falls back to 'unknown' when no IP headers are present", () => {
@@ -93,4 +93,9 @@ describe("rate limiter FAILS CLOSED when a configured shared store errors", () =
     const decision = await rateLimit(withUpstash, "203.0.113.7");
     expect(decision.allowed).toBe(true);
   });
+});
+
+it('trusts proxy header only when explicitly enabled',()=>{
+  process.env.TRUST_PROXY='1';
+  try { expect(clientIp(new Request('http://svc.test',{headers:{'x-forwarded-for':'fake, 70.0.0.1'}}))).toBe('70.0.0.1'); } finally {delete process.env.TRUST_PROXY;}
 });
