@@ -1,13 +1,24 @@
 import { check, hash, INFRA_HOLD, LICENSES, LIMITS, SHA40, type Check, type GithubSpec, type RepoFacts } from './types.js';
 import { licenseFromFile } from './rules.js';
+import { readFileSync } from 'node:fs';
 import { jsonTransport, type JsonRequest } from './http.js';
+
+const GITHUB_TOKEN = /^(?:github_pat_[A-Za-z0-9_]{20,255}|gh[pousr]_[A-Za-z0-9]{20,255})$/;
+/** A read-only token for public repositories raises GitHub's limit from 60 to 5000 requests an
+ * hour. It comes from GITHUB_TOKEN_FILE (a systemd credential); without it GitHub is called anonymously. */
+export function githubToken(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!env.GITHUB_TOKEN_FILE) return undefined;
+  const token = readFileSync(env.GITHUB_TOKEN_FILE, 'utf8').trim();
+  if (!GITHUB_TOKEN.test(token)) throw new Error('GITHUB_TOKEN_FILE does not hold a GitHub token');
+  return token;
+}
 
 type Metadata = { id:number; owner:{login:string}; name:string; private:boolean; visibility:string;
   archived:boolean; disabled:boolean; size:number; default_branch:string };
 export interface GithubResult { checks: Check[]; facts: RepoFacts | null; licenseFile: Buffer | null }
 export const GITHUB_CHECKS = ['github-metadata','github-license','github-commit'];
 export class GithubClient {
-  constructor(private readonly get: JsonRequest = jsonTransport(['api.github.com'])) {}
+  constructor(private readonly get: JsonRequest = jsonTransport(['api.github.com'],undefined,githubToken())) {}
   async headTree(spec: GithubSpec, headCommit: string): Promise<string> {
     if (!SHA40.test(headCommit)) throw new Error('Invalid head');
     const root = `https://api.github.com/repos/${spec.owner}/${spec.repo}`;

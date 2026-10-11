@@ -4,8 +4,9 @@ import { isPublicAddress } from '../src/ssrf-fetch.js';
 
 export type JsonRequest = (url: string, body?: unknown) => Promise<unknown>;
 /** Read-only queries only; fixed host allowlist, vetted/pinned DNS, no redirects,
- * no ambient credentials, total deadline and bounded streaming response. */
-export function jsonTransport(hosts: string[], maxBytes = 4 * 1024 * 1024): JsonRequest {
+ * no ambient credentials, total deadline and bounded streaming response. An explicit
+ * GitHub token is sent to api.github.com only. */
+export function jsonTransport(hosts: string[], maxBytes = 4 * 1024 * 1024, githubToken?: string): JsonRequest {
   return async (uri, body) => {
     const url = new URL(uri);
     if (url.protocol !== 'https:' || url.port && url.port !== '443' || url.username || url.password ||
@@ -29,6 +30,7 @@ export function jsonTransport(hosts: string[], maxBytes = 4 * 1024 * 1024): Json
             (callback as unknown as (error:null, records: Array<{address:string;family:number}>)=>void)(null,[pinned]);
           } else callback(null,pinned.address,pinned.family);
         }, headers:{accept:'application/vnd.github+json','user-agent':'agenc-repo-worker/1',
+          ...(githubToken && url.hostname === 'api.github.com' ? {authorization:`Bearer ${githubToken}`} : {}),
           ...(payload ? {'content-type':'application/json','content-length':String(payload.length)} : {})}},res=>{
         if (res.statusCode !== 200 || Number(res.headers['content-length'] ?? 0) > maxBytes) {
           res.destroy(); finish(new Error('Query status/size')); return;
