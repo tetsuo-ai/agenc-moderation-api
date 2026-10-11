@@ -111,7 +111,8 @@ export class ContainerSandbox implements Sandbox {
       run(['remote','add','origin',${JSON.stringify(`https://github.com/${spec.owner}/${spec.repo}.git`)}]);
       run(['fetch','--depth','1','--no-tags','--no-recurse-submodules','origin',${JSON.stringify(spec.baseCommit)}]);
       if(run(['rev-parse','FETCH_HEAD']).toString().trim()!==${JSON.stringify(spec.baseCommit)})throw Error('Wrong commit');`;
-    await this.exec(['node','-e',init]);
+    // /work/repo does not exist yet, so the init step runs from /work.
+    await this.checked(['exec','--interactive','--workdir','/work',this.id,'node','-e',init]);
     await this.disconnect();
     // No checkout or hooks while networking is attached. Index reads never
     // recurse into submodules and cannot invoke repository filters.
@@ -121,7 +122,8 @@ export class ContainerSandbox implements Sandbox {
   async apply(artifact:Artifact,spec:GithubSpec):Promise<{checks:Check[];snapshot:Snapshot|null}> {
     if (!this.offline) throw new Error('Apply must be offline');
     try {
-      await this.exec(['git',...GIT_FLAGS,'checkout','--detach',spec.baseCommit]);
+      // read-tree filled only the index; -f writes the worktree so apply --index can match it.
+      await this.exec(['git',...GIT_FLAGS,'checkout','-f','--detach',spec.baseCommit]);
       await this.exec(['git',...GIT_FLAGS,'apply','--check','--index','--whitespace=error-all','-'],artifact.patch);
       await this.exec(['git',...GIT_FLAGS,'apply','--index','--whitespace=error-all','-'],artifact.patch);
       const delta = await this.exec(['git',...GIT_FLAGS,'diff','--cached','--no-renames','--numstat','-z',spec.baseCommit]);

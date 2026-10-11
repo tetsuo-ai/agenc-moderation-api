@@ -40,6 +40,9 @@ it('clones/fetches exact SHA with no hooks/submodules/LFS then disconnects befor
   const init=calls.find(a=>a.some(s=>s.includes("run(['fetch'")))!.join(' ');
   for(const s of ['--depth','--no-recurse-submodules','core.hooksPath','/dev/null','GIT_LFS_SKIP_SMUDGE'])expect(calls.flat().join(' ')).toContain(s);
   expect(init).toContain(SPEC.baseCommit);expect(init).toContain('protocol.file.allow=never');
+  const initCall=calls.find(a=>a.some(s=>s.includes("run(['fetch'")))!;
+  expect(initCall[initCall.indexOf('--workdir')+1]).toBe('/work');
+  expect(calls.find(a=>a.includes('checkout'))).toEqual(expect.arrayContaining(['-f','--detach',SPEC.baseCommit]));
   const npm=calls.find(a=>a.includes('ci'))!;expect(npm).toContain('--ignore-scripts');expect(npm).toContain('--registry=https://registry.npmjs.org');
   const test=calls.findIndex(a=>a.at(-1)==='test');
   expect(calls[test-2].slice(0,2)).toEqual(['network','disconnect']);expect(calls[test-1][0]).toBe('inspect');

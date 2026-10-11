@@ -23,7 +23,7 @@ export async function runHttpWorkerOnce(url:string,deps:WorkerDeps,fetcher:typeo
   async function post(path:string,payload:Record<string,unknown>) {
     const res=await fetcher(new URL(path,url),{method:'POST',headers:{'content-type':'application/json'},
       body:JSON.stringify(signQueueRequest(deps.workerId,path,payload,deps.reportKey)),redirect:'error',signal:AbortSignal.timeout(120_000)});
-    if(!res.ok) throw new Error('Queue refused'); return res;
+    if(!res.ok) throw new Error(`Queue refused ${res.status}`); return res;
   }
   const pulled=await post('/internal/worker/pull',{});
   if(pulled.status===204) return false;

@@ -41,10 +41,17 @@ async function main() {
   if(config.queueUrl) {
     const url=new URL(config.queueUrl);
     if(url.protocol !== 'https:' || url.username || url.password) throw new Error('HTTPS queue URL required');
+    // Poll every 5 s while idle. On errors back off to 5 minutes and log one
+    // bounded line, so a broken queue neither floods the journal nor hides why.
+    let failures=0;
     for(;;) {
-      try { if(await runHttpWorkerOnce(config.queueUrl,deps)) continue; }
-      catch { process.stderr.write('Queue unavailable; lease retained\n'); }
-      await new Promise(resolve=>setTimeout(resolve,5000));
+      try { const worked=await runHttpWorkerOnce(config.queueUrl,deps); failures=0; if(worked) continue; }
+      catch(e) {
+        failures++;
+        const reason=(e instanceof Error ? e.message : String(e)).replace(/[^\x20-\x7e]/g,' ').slice(0,200);
+        process.stderr.write(`Queue error (attempt ${failures}): ${reason}\n`);
+      }
+      await new Promise(resolve=>setTimeout(resolve,failures ? Math.min(5000*2**(failures-1),300_000) : 5000));
     }
   }
   await consumeQueue(inputJobs(),deps,
