@@ -2,6 +2,8 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { address } from '@solana/kit';
+import { findTaskModerationPda, AGENC_COORDINATION_PROGRAM_ADDRESS, getRecordTaskModerationInstructionDataEncoder } from '@tetsuo-ai/marketplace-sdk';
 import { base58Encode } from '../src/base58.js';
 import { keyAddress, documentBytes, MANIFEST_DOMAIN } from '../src/verdict.js';
 export function installVerdictFixture() {
@@ -21,4 +23,17 @@ export function installPayerFixture() {
   const pub = key.publicKey.export({format:'der',type:'spki'}).subarray(-32);
   process.env.MODERATION_SIGNER_SECRET=JSON.stringify([...seed,...pub]);
   return { ...key, address:base58Encode(pub) };
+}
+
+/** Throwaway creator wallet, independent of the R credential. */
+export function creatorFixture() {
+  const key=generateKeyPairSync('ed25519');
+  return {...key,address:keyAddress(key.privateKey)};
+}
+
+/** Mock confirmed RPC receipt of the actual record instruction, not just a PDA mention. */
+export async function recordReceipt(record: any) {
+  const [pda]=await findTaskModerationPda({task:address(record.task),moderator:address(record.moderator),jobSpecHash:record.jobSpecHash});
+  return {meta:{err:null},transaction:{message:{accountKeys:[AGENC_COORDINATION_PROGRAM_ADDRESS,record.task,record.moderator,pda],
+    instructions:[{programIdIndex:0,accounts:[0,1,2,3],data:base58Encode(new Uint8Array(getRecordTaskModerationInstructionDataEncoder().encode(record)))}]}}};
 }

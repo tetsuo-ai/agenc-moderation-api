@@ -4,12 +4,13 @@ import { readFileSync } from 'node:fs';
 import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
 
 export interface ServiceConfig {
-  /** Solana RPC endpoint the service reads state from and sends attest txs to. */
+  /** Solana RPC endpoint for read-only task, rent and confirmation queries. */
   rpcUrl: string;
   repositoryWorkers: Record<string,string>;
   repositoryImageDigest: string | null;
   pinEnabled: boolean;
   storePath: string;
+  attestationServiceFeeLamports: number;
   spendLimits: import('./store.js').SpendLimits;
   /** Human label for the cluster (info/reporting only; the RPC is the truth). */
   cluster: string;
@@ -32,8 +33,8 @@ export interface ServiceConfig {
   /** Per-IP requests per window for POST endpoints. */
   rateLimitPerIp: number;
   /**
-   * GLOBAL POST ceiling per window across all callers — the economic bound on
-   * the hot signer key (each CLEAN attest signs + pays a mainnet tx).
+   * GLOBAL POST ceiling per window across all callers — a bound on signer work,
+   * including payment transaction reissues.
    */
   rateLimitGlobal: number;
   /** Rate-limit window in milliseconds. */
@@ -51,6 +52,13 @@ function intEnv(name: string, fallback: number, min = 0): number {
   return parsed;
 }
 
+function safeIntEnv(name:string,fallback:number): number {
+  const raw=process.env[name];
+  if(raw === undefined || raw.trim() === '') return fallback;
+  if(!/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(Number(raw))) throw new Error(`Invalid ${name}`);
+  return Number(raw);
+}
+
 function nonEmpty(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -64,7 +72,8 @@ export function loadConfig(): ServiceConfig {
     repositoryImageDigest: nonEmpty(process.env.WORKER_IMAGE_DIGEST),
     pinEnabled: process.env.ENABLE_SPEC_PINNING === '1',
     storePath: process.env.ATTESTATION_DB_PATH ?? './data/attestations.sqlite',
-    spendLimits: {hourlyLamports:intEnv('SPEND_HOURLY_LAMPORTS',30_000_000),dailyLamports:intEnv('SPEND_DAILY_LAMPORTS',150_000_000),dailyIntakes:intEnv('CREATOR_DAILY_INTAKES',20),hourlyTasks:intEnv('CREATOR_HOURLY_TASKS',5),walletFloor:intEnv('WALLET_FLOOR_LAMPORTS',100_000_000)},
+    attestationServiceFeeLamports: safeIntEnv('ATTESTATION_SERVICE_FEE_LAMPORTS',0),
+    spendLimits: {outstandingTransactions:safeIntEnv('CREATOR_OUTSTANDING_TRANSACTIONS',5),hourlyLamports:intEnv('SPEND_HOURLY_LAMPORTS',30_000_000),dailyLamports:intEnv('SPEND_DAILY_LAMPORTS',150_000_000),dailyIntakes:intEnv('CREATOR_DAILY_INTAKES',20),hourlyTasks:intEnv('CREATOR_HOURLY_TASKS',5),walletFloor:intEnv('WALLET_FLOOR_LAMPORTS',100_000_000)},
     rpcUrl: nonEmpty(process.env.RPC_URL) ?? "https://api.mainnet-beta.solana.com",
     cluster: nonEmpty(process.env.CLUSTER_LABEL) ?? "mainnet",
     jobSpecRegistryUrl: nonEmpty(process.env.JOB_SPEC_REGISTRY_URL) ?? DEFAULT_JOB_SPEC_REGISTRY_URL,

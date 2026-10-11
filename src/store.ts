@@ -18,15 +18,17 @@ export interface StoredIntake {
     expires: number;
     result: string | null;
 }
+/** Legacy name retained for config compatibility; lamport budgets and floor are unused. */
 export interface SpendLimits {
     hourlyLamports: number;
     dailyLamports: number;
     dailyIntakes: number;
     hourlyTasks: number;
     walletFloor: number;
+    outstandingTransactions?: number;
 }
-export const DEFAULT_SPEND_LIMITS: SpendLimits = { hourlyLamports: 30000000, dailyLamports: 150000000, dailyIntakes: 20, hourlyTasks: 5, walletFloor: 100000000 };
-/** Single-host durable journal. Reservations survive crashes and are never automatically resent. */
+export const DEFAULT_SPEND_LIMITS: SpendLimits = { hourlyLamports: 30000000, dailyLamports: 150000000, dailyIntakes: 20, hourlyTasks: 5, walletFloor: 100000000, outstandingTransactions: 5 };
+/** Durable quotas and creator payment offers. Legacy spend rows remain for reconciliation. */
 export class AttestationStore {
     readonly db: DatabaseSync;
     constructor(path: string) {
@@ -37,6 +39,7 @@ export class AttestationStore {
             chmodSync(path, 0o600);
         this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS intakes(task TEXT PRIMARY KEY, hash TEXT NOT NULL, creator TEXT NOT NULL, state TEXT NOT NULL, signature TEXT, expires INTEGER NOT NULL, result TEXT);
+      CREATE TABLE IF NOT EXISTS intake_bindings(task TEXT PRIMARY KEY, hash TEXT NOT NULL, context TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS spend(id INTEGER PRIMARY KEY, task TEXT, creator TEXT, at INTEGER, lamports INTEGER);
       CREATE TABLE IF NOT EXISTS nonces(creator TEXT, nonce TEXT, at INTEGER, PRIMARY KEY(creator,nonce));
       CREATE TABLE IF NOT EXISTS admissions(id INTEGER PRIMARY KEY, task TEXT, hash TEXT, creator TEXT, at INTEGER);
@@ -54,7 +57,7 @@ export class AttestationStore {
         }
     }
     private admitInside(task: string, hash: string, creator: string, limits: SpendLimits, now: number): void {
-        const prior = this.db.prepare('SELECT at FROM admissions WHERE task=? AND hash=? ORDER BY at DESC LIMIT 1').get(task, hash) as {
+        const prior = this.db.prepare('SELECT at FROM admissions WHERE task=? AND hash=? AND creator=? ORDER BY at DESC LIMIT 1').get(task, hash, creator) as {
             at: number;
         } | undefined;
         if (prior && prior.at > now - 72 * 3600000)
@@ -79,39 +82,48 @@ export class AttestationStore {
             throw e;
         }
     }
-    reserve(task: string, hash: string, creator: string, cost: number, balance: number, limits: SpendLimits, now = Date.now(), queued?: {job: Job; context: QueueContext}): void {
+    binding(task: string, hash: string): QueueContext|undefined {
+        const row=this.db.prepare('SELECT context FROM intake_bindings WHERE task=? AND hash=?').get(task,hash) as {context:string}|undefined;
+        return row ? JSON.parse(row.context) as QueueContext : undefined;
+    }
+    rememberBinding(task: string, hash: string, context: QueueContext): void {
+        this.db.prepare('INSERT INTO intake_bindings VALUES(?,?,?) ON CONFLICT(task) DO UPDATE SET hash=excluded.hash,context=excluded.context').run(task,hash,JSON.stringify(context));
+    }
+    assertPaymentCapacity(task: string, creator: string, limits: SpendLimits): void { this.checkOutstanding(task,creator,limits); }
+    private checkOutstanding(task: string, creator: string, limits: SpendLimits): void {
+        const cap=limits.outstandingTransactions ?? DEFAULT_SPEND_LIMITS.outstandingTransactions!;
+        if(!Number.isSafeInteger(cap) || cap<0) throw new ModerationRejectError(503,'Invalid outstanding transaction cap.');
+        const count=this.db.prepare("SELECT COUNT(*) AS n FROM intakes WHERE creator=? AND task<>? AND expires>? AND state IN ('queued','awaiting-payment')").get(creator,task,Date.now()) as {n:number};
+        if(count.n>=cap) throw new ModerationRejectError(429,'Outstanding transaction cap exceeded.');
+    }
+    enqueueIntake(task: string, hash: string, creator: string, limits: SpendLimits, job: Job, context: QueueContext): void {
         this.db.exec('BEGIN IMMEDIATE');
         try {
-            const prior = this.get(task);
-            if (prior?.state === 'queued' && (queued || prior.hash !== hash)) throw new ModerationRejectError(409, 'Task already queued.');
-            if (prior && (prior.state === 'pending' || prior.state === 'reserved' || (prior.state !== 'queued' && prior.expires > now)))
-                throw new ModerationRejectError(409, 'Task already reserved.');
-            this.admitInside(task, hash, creator, limits, now);
-            if (prior?.state === 'queued') this.db.prepare('DELETE FROM spend WHERE id=(SELECT MAX(id) FROM spend WHERE task=?)').run(task);
-            const spend = this.db.prepare('SELECT COALESCE(SUM(lamports),0) AS day, COALESCE(SUM(CASE WHEN at>? THEN lamports ELSE 0 END),0) AS hour FROM spend WHERE at>?').get(now - 3600000, now - 86400000) as {
-                day: number;
-                hour: number;
-            };
-            if (spend.day + cost > limits.dailyLamports || spend.hour + cost > limits.hourlyLamports)
-                throw new ModerationRejectError(429, 'Spend cap exceeded.');
-            // Concurrent reserved transactions may not yet be reflected in RPC balance.
-            const outstanding = this.db.prepare("SELECT COALESCE(SUM(lamports),0) AS n FROM spend WHERE task<>? AND id IN (SELECT MAX(id) FROM spend GROUP BY task) AND task IN (SELECT task FROM intakes WHERE state IN ('queued','reserved','pending'))").get(task) as {
-                n: number;
-            };
-            if (balance - cost - outstanding.n < limits.walletFloor)
-                throw new ModerationRejectError(503, 'Wallet floor reached.');
-            this.db.prepare("INSERT OR REPLACE INTO intakes VALUES(?,?,?,?,NULL,?,NULL)").run(task, hash, creator, queued ? 'queued':'reserved', now + 72 * 3600000);
-            if (queued) this.insertJob(queued.job, queued.context, now);
-            this.db.prepare('INSERT INTO spend(task,creator,at,lamports) VALUES(?,?,?,?)').run(task, creator, now, cost);
-            this.audit('reserved', { task, hash, creator, cost });
+            const prior=this.get(task);
+            if(prior && (prior.expires>Date.now() || ['reserved','pending'].includes(prior.state))) throw new ModerationRejectError(409,'Task already admitted.');
+            this.checkOutstanding(task,creator,limits);
+            this.admitInside(task,hash,creator,limits,Date.now());
+            this.db.prepare("INSERT OR REPLACE INTO intakes VALUES(?,?,?,'queued',NULL,?,NULL)").run(task,hash,creator,Date.now()+72*3600000);
+            this.insertJob(job,context,Date.now());this.audit('queued',{task,hash,creator});
             this.db.exec('COMMIT');
-        }
-        catch (e) {
-            this.db.exec('ROLLBACK');
-            throw e;
-        }
+        } catch(e) { this.db.exec('ROLLBACK'); throw e; }
     }
-    submitted(task: string, signature: string): void { this.db.prepare("UPDATE intakes SET state='pending',signature=? WHERE task=?").run(signature, task); this.audit('submitted', { task, signature }); }
+    /** Compare-and-swap publishes one offer even if two async builders race. */
+    saveOffer<T>(task: string, hash: string, creator: string, result: T, expires: number, limits: SpendLimits, expectedResult?: string|null): T {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+            const prior=this.get(task);
+            if(prior && (prior.expires>Date.now() || ['reserved','pending'].includes(prior.state)) && prior.hash!==hash) throw new ModerationRejectError(409,'One live hash per task.');
+            if(prior?.result && prior.expires>Date.now() && prior.result!==expectedResult) {
+                this.db.exec('COMMIT');return JSON.parse(prior.result) as T;
+            }
+            if(prior && ['reserved','pending'].includes(prior.state)) throw new ModerationRejectError(409,'Legacy payment needs reconciliation.');
+            this.checkOutstanding(task,creator,limits);
+            this.admitInside(task,hash,creator,limits,Date.now());
+            this.db.prepare("INSERT OR REPLACE INTO intakes VALUES(?,?,?,'awaiting-payment',NULL,?,?)").run(task,hash,creator,expires,JSON.stringify(result));
+            this.audit('payment-offer',{task,hash,creator});this.db.exec('COMMIT');return result;
+        } catch(e) { this.db.exec('ROLLBACK');throw e; }
+    }
     finish(task: string, result: unknown, expires: number): void { this.db.prepare("UPDATE intakes SET state='confirmed',result=?,expires=? WHERE task=?").run(JSON.stringify(result), expires, task); this.audit('confirmed', { task }); }
     saveVerdict(task: string, hash: string, creator: string, result: unknown, expires: number): void {
         const attestation = (result as {
@@ -155,9 +167,6 @@ export class AttestationStore {
     }
     finishJob(id: string, result: unknown, expires: number): void {
         this.db.prepare("UPDATE jobs SET state='done',result=?,expires=? WHERE id=?").run(JSON.stringify(result),expires,id);
-    }
-    releaseQueuedSpend(task: string): void {
-        if(this.get(task)?.state === 'queued') this.db.prepare('DELETE FROM spend WHERE id=(SELECT MAX(id) FROM spend WHERE task=?)').run(task);
     }
     close(): void { this.db.close(); }
 }

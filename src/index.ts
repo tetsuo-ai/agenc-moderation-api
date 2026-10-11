@@ -43,3 +43,5 @@ export type { Job, GithubSpec, Report, RepoFacts, Check } from '../worker/types.
 
 export { enqueueDeliverable, acceptQueuedReport, runDevelopmentWorkerOnce } from './repo-queue.js';
 export { runHttpWorkerOnce, signQueueRequest } from '../worker/queue-http.js';
+
+export type { PaymentOffer, PaymentPrice } from './payment.js';

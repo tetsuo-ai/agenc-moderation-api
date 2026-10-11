@@ -1,13 +1,11 @@
 # AgenC Desktop attestor — queued repository intake and deliverable review
 
-Revision 5 task intake with creator binding, a durable SQLite journal, bounded
-payer spending, and signed off-chain verdicts. This service can sign and pay
-transactions when operated with a roster/payer key. Development tests mock all
-RPC submission and registry writes. Phase 2 adds isolated public repository
-screening, artifact review, signed worker reports and independent signer checks.
-The internal worker review is off-chain; its durable adapter records moderation
-with R only after a clean repository report, then signs the final verdict with V.
-Deliverable review never sends a chain transaction. No program upgrade is required.
+Revision 5 task intake with creator binding, a durable SQLite journal, creator
+quotas, and V-signed off-chain verdicts. AgenC is the only attestor. Its roster key
+R partially signs payment transactions; the task creator co-signs and submits
+them. The service never submits Solana transactions. Repository screening uses
+signed worker reports and independent signer checks. Deliverable reviews stay
+off-chain and require no payment. No program upgrade is required.
 
 ## HTTP contract
 
@@ -19,44 +17,90 @@ Deliverable review never sends a chain transaction. No program upgrade is requir
 - `GET /v1/keys`: offline-root signed key manifest.
 - `GET /v1/policy`, `/v1/info`, `/v1/health`, `/openapi.json`.
 
-Desktop posts `{task, jobSpecHash, specUri, spec}`. When the canonical payload
-contains `custom.github`, the signer checks creator binding, Open/unclaimed task,
-pinned hash, one live hash, quotas, roster/key availability and spend controls,
-then atomically saves a `repo-intake` job and budget reservation in SQLite.
-The first POST returns **202**, with this response (extra scan summary fields may
-also be present):
+Desktop posts `{task, jobSpecHash, specUri, spec}`. A canonical payload with
+`custom.github` checks creator binding, Open/unclaimed task, pinned hash, one live
+hash, quotas, outstanding capacity and roster/key availability, then atomically
+queues a `repo-intake` job. The first POST returns **202**:
 
 ```json
 {"ok":true,"moderator":"<R>","attested":false,"pending":true,"jobId":"<uuid>","retryAfterSeconds":5,"attestation":null}
 ```
 
-Repeat the same POST after five seconds, or poll the intake GET. GET returns
-**404** until a final verdict is stored; it does not start or resume work. A
-worker report is authenticated by its separate report key and independently
-rechecked by the signer against the durable spec and current task/spec/GitHub
-facts. A clean result records the revision 5 moderation PDA with R, then returns
-**200**, for example:
+Repeat POST after five seconds. GET returns **404** until the worker result has
+been independently checked and a final verdict is stored. GET does not start or
+resume work. A CLEAN verdict returns **200** with a payment offer, for example:
 
 ```json
-{"ok":true,"moderator":"<R>","attested":true,"verdict":"clean","riskScore":0,"specHash":"<hash>","policyHash":"<hash>","attestation":{"signature":"<transaction signature>","recordedAt":"<ISO UTC>","expiresAt":"<ISO UTC>"},"signedVerdict":{"body":{"v":1,"kind":"task-intake","scope":"repository","repo":{"id":123,"owner":"example","name":"public-repo","licenseSpdx":"MIT","baseCommit":"<40 hex>","treeSha":"<40 hex>","allowedPathsHash":"<64 hex>","maxDiffBytes":100000,"testCommandHash":"<64 hex>"},"verdict":"clean","reasons":[],"record":{"moderator":"<R>","pda":"<moderation PDA>","txSignature":"<transaction signature>"}},"signature":"<V signature>"}}
+{
+  "ok": true,
+  "moderator": "<R>",
+  "attested": false,
+  "verdict": "clean",
+  "attestation": null,
+  "transaction": "<base64 partially signed Solana wire transaction>",
+  "lastValidBlockHeight": 123456,
+  "priceLamports": 2519520,
+  "rentLamports": 2519520,
+  "serviceFeeLamports": 0,
+  "recordPda": "<TaskModeration PDA>",
+  "signedVerdict": {
+    "body": {
+      "kind": "task-intake",
+      "verdict": "clean",
+      "creator": "<creator>",
+      "payment": {"recordPda": "<TaskModeration PDA>", "priceLamports": 2519520, "payer": "<creator>"},
+      "record": {"moderator": "<R>", "pda": "<TaskModeration PDA>", "txSignature": null}
+    },
+    "signature": "<V Ed25519 signature in hex>"
+  }
+}
 ```
 
-The example abbreviates the signed body's context, checks and time fields;
-see the verdict contract below. `allowedPathsHash` and `testCommandHash` are
-SHA-256 of canonical JSON values. Repo ID is numeric for reviewed GitHub jobs.
-Hold maps to `suspicious`; reject maps to `blocked`. Both return **200** with
-`attested:false`, `attestation:null`, signed `reasons`, and
-`record:{moderator:"<R>",pda:null,txSignature:null}`. They create no chain record
-and release their unsent budget; their creator admission still counts.
+The example abbreviates the signed context, repo, checks and time fields. Repo
+ID is numeric; `allowedPathsHash` and `testCommandHash` are SHA-256 of canonical
+JSON values. Non-repository intake can return its offer immediately with **200**.
 
-Ambiguous chain submission returns **202** with the same job ID,
-`retryAfterSeconds:5`, `pending:true`, `attested:false`, and the journaled
-`attestation.signature`. POST again after the PDA exists to finish the final
-V verdict. Retries never send another transaction. Stored results are returned
-by POST or GET with **200** until expiry. Repository preflight returns **200**,
-`preflightOnly:true`, `wouldAttest:false`; it cannot predict a worker review.
-Repository jobs require the canonical SDK payload hash; legacy raw-text hashes
-remain supported for non-repository intake only.
+Desktop verifies the V signature and key manifest, independently reads the Task
+creator, and validates the transaction against the signed `payment` and `record`
+bindings. The transaction uses that creator as fee payer and has exactly two
+instructions, in this order (no compute-budget instructions or address tables):
+
+1. SystemProgram transfer from creator to R of `rentLamports + serviceFeeLamports`.
+2. `record_task_moderation` for the signed task/hash, CLEAN status, risk score,
+   policy/scanner hashes and expiry, with R as signer and program rent payer.
+
+Desktop checks the record PDA, instruction accounts/data, total price, creator
+fee payer, valid R signature and absence of other instructions. It adds the
+creator signature **without modifying the message**, sends the transaction from
+its own wallet/RPC, and confirms before `lastValidBlockHeight`. The creator pays
+both the transfer and network fees. Rent comes from
+`getMinimumBalanceForRentExemption(getTaskModerationSize())`; revision 5 currently
+needs 2,519,520 lamports. `ATTESTATION_SERVICE_FEE_LAMPORTS` defaults to **0**.
+R receives rent before the program debits it, and never pays network fees: its
+balance is unchanged with a zero service fee, or increases by the service fee.
+Instruction failure rolls back the transfer and record creation atomically;
+the creator still pays the network fee. Later `close_task` returns record rent
+to **R**, as required by the unchanged program; it does not refund the creator.
+
+After confirmation, GET `/v1/attestations/:task/:hash` returns **200** with
+`attested:true`, `attestation.signature`, and a V-signed `record.txSignature`.
+The signature is resolved from confirmed PDA history and verified against the
+actual record instruction. There is no `transaction` or `lastValidBlockHeight`
+once paid. A valid record that already exists also returns no payment offer.
+The RPC must provide confirmed transaction history for receipt lookup.
+
+While a blockhash is live, repeat POST returns the identical stored offer.
+After blockheight expiry, repeat POST produces a fresh R-partially-signed
+transaction for the **same V-signed verdict, price and record expiry**, without
+another quota admission. Reissues are subject to POST rate limits. A rent
+increase beyond the originally quoted rent refuses reissue rather than exposing
+R to a debit. A new verdict after verdict expiry requires fresh intake; a live
+task cannot acquire a second hash. Hold/reject verdicts return **200** with signed
+reasons, `attestation:null`, `payment:null`, and no transaction.
+
+Repository preflight returns **200**, `preflightOnly:true`, `wouldAttest:false`;
+it cannot predict a worker review. Repository jobs require the canonical SDK
+payload hash; legacy raw-text hashes remain supported for other intake.
 
 For a deliverable, Desktop posts exactly:
 
@@ -84,8 +128,8 @@ Errors use `{ok:false,moderator:null,error:"Request could not be completed.",log
 creator/worker authentication failure, **404** missing task/submission/result,
 **409** task/hash/submission/lease conflicts, changed policy or unavailable spec,
 **413** body size limit, **422** hash mismatch or invalid GitHub spec, **429**
-IP/creator quota or spend cap, **502** upstream/recheck/chain failure, **503**
-unavailable R/V/worker/roster or wallet floor. Spec retrievability errors also carry
+IP/creator quota or outstanding-transaction cap, **502** upstream/recheck/chain failure, **503**
+unavailable R/V/worker/roster or invalid payment configuration. Spec retrievability errors also carry
 `code:"SPEC_NOT_RETRIEVABLE",retryable:true`. IP 429 includes `retryAfterSeconds`
 and a `Retry-After` header. See `/openapi.json` for request/response schemas.
 
@@ -94,7 +138,7 @@ Listing writes return 410. POST responses have no CORS headers. Compat returns
 includes `moderator`. `preflightOnly:true` never signs any message or transaction,
 pays rent, consumes a nonce, or pins; it returns `attested:false`, `preflightOnly:true`
 and `wouldAttest`. A true `wouldAttest` means the scanner and task binding pass
-with a payer configured; spend, custody and retrievability checks still apply at intake.
+with R configured; quota, outstanding-capacity, custody and retrievability checks still apply at intake.
 
 Tasks must exist and be Open with `currentWorkers=0` and `completions=0`. Binding
 requires `description[0..32] == jobSpecHash`, or creator authorization. A different
@@ -119,14 +163,14 @@ nonce=<lowercase hex>
 ```
 
 A verified authorization nonce is single use even if later checks refuse intake.
-For an already admitted repository job, the exact originally accepted
+For an unexpired admitted intake, the exact originally accepted
 authorization can be reused, including after its initial five-minute window;
 that durable authorization stays bound to the same task, hash and creator. Other
 requests require a fresh authorization, or the commitment-bound path.
 
 ## Verdicts and offline keys
 
-R is the on-chain roster/payer key; V is a separate Ed25519 verdict key. Provision
+R is the AgenC on-chain roster key and program rent payer; V is a separate Ed25519 verdict key. Provision
 R as a Solana 64-byte JSON keypair file via `MODERATION_SIGNER_SECRET_FILE` and V
 as PKCS8 PEM via `VERDICT_KEY_FILE`. Both work with systemd credentials. Production
 refuses `MODERATION_SIGNER_SECRET`, `MODERATION_AUTHORITY_SECRET`, and
@@ -163,7 +207,8 @@ historical public keys for verification for at least the 72-hour verdict TTL.
 "agenc-desktop-attestation/v1" || 0x00 || canonicalJson(body)`. Body fields are
 `v`, `kind:task-intake`, `cluster`, `genesisHash`, `programId`, `taskPda`, `creator`,
 `jobSpecHash`, `jobSpecUri`, optional `repo`, `policyHash`, `scannerHash`, `verdict`,
-`riskScore`, `categories`, `reasons`, `record:{moderator,pda,txSignature}`,
+`riskScore`, `categories`, `reasons`, `payment:{recordPda,priceLamports,payer}`
+(or null without an offer), `record:{moderator,pda,txSignature}`,
 `issuedAt`, `expiresAt`, `nonce`, `keyId`. Expiry is 72 hours, capped by an existing
 record's expiry when reused. Repo metadata, when present, must include `id`,
 `owner`, `name`, `licenseSpdx`, 40-hex `baseCommit` and `treeSha`, 64-hex
@@ -175,40 +220,33 @@ metadata alone is a spec commitment and does not constitute repository screening
 ## Persistent controls
 
 `ATTESTATION_DB_PATH` defaults to `./data/attestations.sqlite`. Use durable local
-storage, one signer service per payer wallet, and preserve the database and WAL
-through restart/upgrade. SQLite FULL synchronization and immediate transactions
-serialize quota and spend reservations. A task has one live hash. Defaults are
-20 intakes per creator per rolling day, five distinct tasks per hour, 30 million
-lamports/hour, 150 million/day, and a 100 million lamport wallet floor. See
-[service.env.example](deploy/service.env.example) for knobs. Caps may be set to
-zero to stop intake. IP limits supplement the creator quotas.
+storage, one signer service per R key, and preserve the database and WAL through
+restart/upgrade. SQLite FULL synchronization and immediate transactions serialize
+admissions and offer publication; concurrent builders return the stored winner.
+Defaults are 20 intakes per creator per rolling day, five distinct tasks per hour,
+and five outstanding creator payment slots (`CREATOR_OUTSTANDING_TRANSACTIONS`).
+Queued repository jobs reserve a slot; a hold/reject verdict releases it, while
+a CLEAN offer keeps it until payment is reconciled or its verdict expires.
+Blockhash expiry alone keeps the slot so the same offer can be reissued. Reissues
+consume no additional slot. Set a quota/cap to zero to stop new intake. IP and
+global POST limits also bound reissues. See [service.env.example](deploy/service.env.example).
 
-Before signing, the service reads the moderation PDA, reserves rent from
-`getMinimumBalanceForRentExemption` plus `getFeeForMessage`, and checks
-`getBalance` including outstanding reservations. Transactions have a 200,000
-compute-unit limit and 1,000 micro-lamports/CU priority fee; total network fee
-above 100,000 lamports is refused. Before submission, the exact signature is
-journaled. Confirmation tracks `lastValidBlockHeight`. Ambiguous submission,
-confirmation timeout or blockheight expiry returns HTTP 202 with the signature,
-`pending:true`, and `attested:false`; retries never automatically create another
-transaction. Retry intake after the PDA appears to finalize the signed result.
-A reserved entry left by a crash before signing, expired transaction, failed
-transaction, or an expired existing PDA needs operator reconciliation. Inspect
-chain state and signature history before any manual journal change. Spend
-reservations remain conservative; they are not automatically refunded.
+Task records have no spend-ledger or wallet-floor dependency. No service path
+pays Solana transaction fees; R only needs a small balance for operator-managed
+roster maintenance. For a nonzero service fee, retain the ordinary rent-exempt
+minimum for its system wallet; a zero-to-dust wallet transition can fail Solana
+runtime rent checks. This introduces no service-funded transaction fees. Legacy `SPEND_HOURLY_LAMPORTS`, `SPEND_DAILY_LAMPORTS` and
+`WALLET_FLOOR_LAMPORTS` settings have no effect on task intake. Historical spend
+rows remain for operator reconciliation; old
+`reserved`/`pending` entries cannot be automatically replaced. Inspect their
+chain state before modifying the journal. Existing signed verdicts whose policy
+binding changed need operator review.
 
-Queue admission reserves rent plus the bounded 100,000-lamport fee ceiling;
-completion replaces that budget with the exact transaction cost once. Queued
-budgets count toward hourly/daily caps and outstanding wallet commitments. A
-held/rejected or reused existing-record result releases an unsent queue budget.
-Submitted reservations remain conservative and are never automatically refunded.
-Expired queue work is not silently replaced; reconcile its reservation first.
-
-The `audit`, `admissions`, `spend`, `nonces`, `jobs`, and `intakes` tables retain the local
-journal. Restrict DB access to the signer OS user; back it up consistently with
-SQLite's backup tooling. Request failures return a generic message and `logId`;
-the journalctl log stores the ID and error type, without request contents or
-upstream error details.
+The `audit`, `admissions`, `intake_bindings`, `nonces`, `jobs`, and `intakes` tables
+retain quotas, authorizations, payment offers and receipts. Restrict DB access
+to the signer OS user and back it up consistently. Request failures return a
+generic message and `logId`; logs store the ID and error type without request
+contents or upstream error details.
 
 Pinning defaults off. Enable only with `ENABLE_SPEC_PINNING=1`, an operator
 `JOB_SPEC_REGISTRY_TOKEN`, and a valid creator-wallet authorization. A description
@@ -410,8 +448,12 @@ package. It pulls from the same persistent queue and runs `processJob` in proces
 inject a mocked `Sandbox` (clone/apply/test/close), GitHub, registry/OSV and RPC.
 It is disabled under `NODE_ENV=production`. This is dependency injection, not an
 automatic success report or a container daemon. The complete local examples are
-[test/repo-queue.test.ts](test/repo-queue.test.ts), including mocked chain recording
-and signature verification:
+[test/repo-queue.test.ts](test/repo-queue.test.ts), including payment offers and
+signature verification. [test/payment-litesvm.test.ts](test/payment-litesvm.test.ts)
+loads the SDK's bundled compiled `agenc_coordination.so` in LiteSVM using
+throwaway keys. It executes the actual API offer after creator co-signing, checks
+R's balance and exact rent, exercises failure rollback, and verifies that
+`close_task` returns the rent to R. No live RPC or container daemon is used:
 
 ```sh
 npm test -- --maxWorkers=2

@@ -15,6 +15,7 @@ import { clientIp, limiterMode, rateLimit } from "./rate-limit.js";
 import { MAX_BODY_BYTES } from "./limits.js";
 import {
   attestTask,
+  getStoredAttestation,
   loadModeratorSigner,
   ModerationRejectError,
   ModerationSignerUnavailableError,
@@ -132,6 +133,7 @@ function attestDeps(config: ServiceConfig): AttestDeps {
     cluster: config.cluster,
     store: getStore(config.storePath),
     spendLimits: config.spendLimits,
+    attestationServiceFeeLamports: config.attestationServiceFeeLamports,
   };
 }
 
@@ -251,6 +253,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request, overr
       expiresAt: result.attestation?.expiresAt ?? null,
       ...(payloadHashFromText ? { payloadHash: payloadHashFromText } : {}),
     },
+    ...Object.fromEntries(['transaction','lastValidBlockHeight','priceLamports','rentLamports','serviceFeeLamports','recordPda'].filter(k=>k in result).map(k=>[k,result[k as keyof ModerationResult]])),
     txSignature: result.attestation?.signature ?? null,
     ...(result.attestation
       ? {
@@ -290,7 +293,8 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
       pinEnabled:config.pinEnabled,
       pinCredential: config.pinEnabled && config.jobSpecRegistryToken ? "registry-token" : "disabled",
     },
-    spendLimits: config.spendLimits,
+    creatorLimits: {dailyIntakes:config.spendLimits.dailyIntakes,hourlyTasks:config.spendLimits.hourlyTasks,outstandingTransactions:config.spendLimits.outstandingTransactions},
+    attestationServiceFeeLamports: config.attestationServiceFeeLamports,
     apiKeyRequired: config.apiKeys.length > 0,
     rateLimit: {
       mode: limiterMode(config),
@@ -334,9 +338,9 @@ export function createModerationApi(configOverride?: Partial<ServiceConfig>, ove
         if (path === '/v1/keys') return json({ok:true,manifest:loadKeyManifest()});
         const match = /^\/v1\/attestations\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
         if(match) {
-          const stored = (overrides.store ?? getStore(config.storePath)).get(match[1]);
-          if(!stored || stored.hash !== match[2] || !stored.result || stored.expires <= Date.now()) return errorJson(404,'Attestation unavailable.');
-          return json({ok:true,attested:stored.state === 'confirmed',...JSON.parse(stored.result)});
+          const result=await getStoredAttestation({...attestDeps(config),...overrides},match[1],match[2]);
+          if(!result) return errorJson(404,'Attestation unavailable.');
+          return json({ok:true,attested:result.attestation !== null,...result});
         }
         const deliverable=/^\/v1\/deliverable-reviews\/([^/]+)\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
         if(deliverable) {

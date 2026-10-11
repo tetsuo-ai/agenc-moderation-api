@@ -1,7 +1,7 @@
 {
   "name": "@tetsuo-ai/agenc-moderation-api",
   "version": "0.2.1",
-  "description": "AgenC Desktop phase 1 attestor: creator-bound task intake, durable spend controls and domain-separated Ed25519 verdicts for revision 5.",
+  "description": "AgenC Desktop phase 1 attestor: creator-paid task intake, durable creator quotas and domain-separated Ed25519 verdicts for revision 5.",
   "packageManager": "npm@11.7.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -42,6 +42,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "litesvm": "1.1.0",
     "tsup": "8.5.1",
     "typescript": "5.9.3",
     "vitest": "4.1.8"

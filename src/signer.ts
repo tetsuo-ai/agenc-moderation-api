@@ -1,6 +1,7 @@
 import { scannerHash as repositoryScannerHash } from '../worker/rules.js';
 import { validateJob, type GithubSpec } from '../worker/types.js';
 import type { GithubClient } from '../worker/github.js';
+import { buildPaymentOffer, readPaymentPrice, type PaymentOffer } from './payment.js';
 import { assertJsonDepth } from './json-depth.js';
 /** Creator-bound revision 5 task intake. All network boundaries are mockable in tests. */
 
@@ -11,29 +12,21 @@ import { authorizedVerdictKey, signDocument, type SignedDocument } from "./verdi
 import { createHash, randomBytes } from "node:crypto";
 import {
   address,
-  compileTransaction,
-  getBase64Decoder,
-  appendTransactionMessageInstructions,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
-  createTransactionMessage,
-  getBase64EncodedWireTransaction,
-  pipe,
-  setTransactionMessageFeePayerSigner,
-  setTransactionMessageLifetimeUsingBlockhash,
-  signTransactionMessageWithSigners,
   signature as solanaSignature,
   type Address,
-  type TransactionMessageBytesBase64,
   type Instruction,
   type TransactionSigner,
 } from "@solana/kit";
 import {
+  getRecordTaskModerationInstructionDataDecoder,
+  getRecordTaskModerationDiscriminatorBytes,
+  type TaskModeration,
   facade,
   AGENC_COORDINATION_PROGRAM_ADDRESS,
   fetchMaybeTaskModeration,
   findTaskModerationPda,
-  getTaskModerationSize,
   fetchMaybeTask,
   fetchMaybeTaskJobSpec,
   fetchMaybeModerationConfig,
@@ -43,7 +36,7 @@ import {
   findModerationAttestorPda,
   values,
 } from "@tetsuo-ai/marketplace-sdk";
-import { base58Decode, base58Encode } from "./base58.js";
+import { base58Decode } from "./base58.js";
 import { fetchJobSpecBody, JobSpecCheckError } from "./ssrf-fetch.js";
 import { moderationPolicyHashBytes, moderationPolicyHashHex } from "./policy.js";
 import { scanPayload, scannerHashBytes, scannerHashHex, type Verdict } from "./scan.js";
@@ -344,7 +337,7 @@ export async function resolveSpecAgainstHash(params: {
 /* ============================== attest core ============================== */
 
 /** The response shape (SDK `ListingModerationResult` / `TaskModerationResult`). */
-export interface ModerationResult {
+export interface ModerationResult extends Partial<Omit<PaymentOffer,'moderator'>> {
   verdict: Verdict;
   riskScore: number;
   /** Canonical spec hash (hex) — equals the on-chain spec_hash. */
@@ -354,18 +347,18 @@ export interface ModerationResult {
    * P1.2 `moderator` argument. Null in verdict-only mode (no signer).
    */
   moderator: string | null;
-  /** Present only on a CLEAN verdict that was signed + sent; null when held. */
+  /** Present only on a CLEAN verdict with a confirmed on-chain record; null when held. */
   attestation: { signature: string; recordedAt: string; expiresAt: string | null } | null;
   /** sha256 of the moderation policy document (hex) the attestation commits to. */
   policyHash: string;
   /**
-   * Present only on attested results: a retrievable copy of the exact spec
-   * content was verified (or pinned) BEFORE the attestation was recorded.
+   * Present on payment offers and attested results: a retrievable copy of the exact spec
+   * content was verified (or pinned) before the offer was signed.
    */
   retrievable?: true;
-  /** Present only on attested results: this service published the spec itself. */
+  /** Present on payment offers and attested results: this service published the spec itself. */
   pinned?: boolean;
-  /** Present only on attested results: https URL where the spec is retrievable. */
+  /** Present on payment offers and attested results: https URL where the spec is retrievable. */
   specRegistryUri?: string;
   pending?: boolean;
   jobId?: string;
@@ -373,66 +366,6 @@ export interface ModerationResult {
   preflightOnly?: boolean;
   wouldAttest?: boolean;
   signedVerdict?: SignedDocument;
-  recordPda?: string;
-}
-
-function firstTransactionSignatureBase58(signed: {
-  signatures: Readonly<Record<string, Uint8Array | null>>;
-}): string {
-  const sig = Object.values(signed.signatures).find(
-    (value): value is Uint8Array => value instanceof Uint8Array,
-  );
-  if (!sig) throw new Error("Moderation attestation transaction was not signed.");
-  return base58Encode(sig);
-}
-
-/**
- * Build + sign + send one moderation attestation transaction. The moderator is
- * the fee payer + the only signer. Returns the confirmed signature.
- */
-export async function signAndSend(
-  rpcUrl: string, instruction: Instruction, moderator: TransactionSigner,
-  journal: {store: AttestationStore; task: string; reserve: (cost: number,balance: number)=>void},
-): Promise<{signature: string; pending: boolean}> {
-  const rpc = createSolanaRpc(rpcUrl);
-  const { value: latestBlockhash } = await rpc.getLatestBlockhash({commitment:'confirmed'}).send();
-  const computeProgram = address('ComputeBudget111111111111111111111111111111');
-  const limit = Buffer.alloc(5); limit[0]=2; limit.writeUInt32LE(200_000,1);
-  const fee = Buffer.alloc(9); fee[0]=3; fee.writeBigUInt64LE(1_000n,1);
-  const message = pipe(createTransactionMessage({version:0}),
-    m=>setTransactionMessageFeePayerSigner(moderator,m),
-    m=>setTransactionMessageLifetimeUsingBlockhash(latestBlockhash,m),
-    m=>appendTransactionMessageInstructions([{programAddress:computeProgram,data:limit},{programAddress:computeProgram,data:fee},instruction],m));
-  if(!journal) throw new ModerationRejectError(503,'Durable spend journal required.');
-  {
-    const encoded = getBase64Decoder().decode(compileTransaction(message).messageBytes);
-    const {value: networkFee} = await rpc.getFeeForMessage(encoded as TransactionMessageBytesBase64,{commitment:'confirmed'}).send();
-    if(networkFee === null || networkFee < 0n || networkFee > 100_000n) throw new ModerationRejectError(503,'Fee exceeds bound.');
-    const rent = await rpc.getMinimumBalanceForRentExemption(BigInt(getTaskModerationSize())).send();
-    const {value:balance} = await rpc.getBalance(moderator.address,{commitment:'confirmed'}).send();
-    const cost = Number(rent+networkFee);
-    if(!Number.isSafeInteger(cost) || !Number.isSafeInteger(Number(balance))) throw new ModerationRejectError(503,'Invalid balance.');
-    journal.reserve(cost,Number(balance));
-  }
-  const signed = await signTransactionMessageWithSigners(message);
-  const signature = firstTransactionSignatureBase58(signed);
-  // Journal BEFORE submission: errors after submission are ambiguous, never resend.
-  journal.store.submitted(journal.task,signature);
-  try {
-    await rpc.sendTransaction(getBase64EncodedWireTransaction(signed),{encoding:'base64',preflightCommitment:'confirmed',maxRetries:0n}).send();
-  } catch { return {signature,pending:true}; }
-  const deadline = Date.now()+Number(process.env.CONFIRMATION_TIMEOUT_MS ?? 90_000);
-  for (;;) {
-    try {
-      const {value} = await rpc.getSignatureStatuses([solanaSignature(signature)],{searchTransactionHistory:true}).send();
-      const status = value[0];
-      if(status?.err != null) { journal.store.audit('chain-failed',{task:journal.task,signature}); throw new ModerationRejectError(502,'Transaction failed.'); }
-      if(status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return {signature,pending:false};
-      if(await rpc.getBlockHeight({commitment:'confirmed'}).send() > latestBlockhash.lastValidBlockHeight) return {signature,pending:true};
-    } catch(e) { if(e instanceof ModerationRejectError) throw e; return {signature,pending:true}; }
-    if(Date.now() >= deadline) return {signature,pending:true};
-    await new Promise(resolve=>setTimeout(resolve,1500));
-  }
 }
 
 export interface AttestDeps {
@@ -446,6 +379,7 @@ export interface AttestDeps {
   cluster?: string;
   store?: AttestationStore;
   spendLimits?: SpendLimits;
+  attestationServiceFeeLamports?: number;
   repository?: { workers: Readonly<Record<string,string>>; imageDigest: string; github?: GithubClient };
 }
 
@@ -465,7 +399,7 @@ function attestedRetrievabilityFields(
   };
 }
 
-/** Validate binding, scan, journal, then pay once and sign a separate verdict. */
+/** Validate binding, scan, journal, then offer a creator-paid transaction and sign a separate verdict. */
 export async function attestTask(deps: AttestDeps, params: {
   task: string; jobSpecHash?: string; spec?: Record<string,unknown>; specUri?: string; rawText?: string;
   creatorAuthorization?: CreatorAuthorization; preflightOnly?: boolean;
@@ -482,15 +416,16 @@ export async function attestTask(deps: AttestDeps, params: {
   if(!/^[0-9a-f]{64}$/.test(target)) throw new ModerationRejectError(400,'Invalid hash.');
   if(pinned.exists && toHex(pinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Different hash already pinned.');
   const store = deps.store ?? getStore();
+  const existing = store.get(params.task);
   const queuedJob = store.intakeJob(params.task,target);
-  const queuedContext = queuedJob ? JSON.parse(queuedJob.context) as import('./store.js').QueueContext : undefined;
+  const queuedContext = queuedJob ? JSON.parse(queuedJob.context) as import('./store.js').QueueContext : existing && existing.expires>Date.now() ? store.binding(params.task,target) : undefined;
   const priorAuthorization = queuedContext?.authenticatedCreator && queuedContext.creator === task.data.creator;
   const admittedAuthorization = queuedContext?.creatorAuthorization && JSON.stringify(queuedContext.creatorAuthorization) === JSON.stringify(params.creatorAuthorization);
   const authenticatedCreator = priorAuthorization && (!params.creatorAuthorization || admittedAuthorization)
     ? (task.data.status === 0 && task.data.currentWorkers === 0 && task.data.completions === 0 ? true : (()=>{throw new ModerationRejectError(409,'Task changed.');})())
     : bindRequester(task.data,params.task,target,params.creatorAuthorization,store,params.preflightOnly);
-  const existing = store.get(params.task);
   if(existing && (existing.expires > Date.now() || ['queued','reserved','pending'].includes(existing.state)) && existing.hash !== target) throw new ModerationRejectError(409,'One live hash per task.');
+  if(!params.preflightOnly) store.rememberBinding(params.task,target,{payload:params.spec ?? {},creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization ?? queuedContext?.creatorAuthorization,specUri:params.specUri});
   const resolved = await resolveSpecAgainstHash({targetHashHex:target,spec:params.spec,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined),rawText:params.rawText,what:'task spec'});
   let repo = resolved.payload.repo;
   const custom = resolved.payload.custom as {github?:unknown} | undefined;
@@ -511,11 +446,8 @@ export async function attestTask(deps: AttestDeps, params: {
       if(!queuedJob) {
         authorizedVerdictKey(moderator.address);
         await resolveSignerMode(rpc,moderator);
-        const rent=await rpc.getMinimumBalanceForRentExemption(BigInt(getTaskModerationSize())).send();
-        const {value:balance}=await rpc.getBalance(moderator.address,{commitment:'confirmed'}).send();
-        const cost=Number(rent+100_000n);
-        if(!Number.isSafeInteger(cost) || !Number.isSafeInteger(Number(balance))) throw new ModerationRejectError(503,'Invalid balance.');
-        store.reserve(params.task,target,task.data.creator,cost,Number(balance),deps.spendLimits ?? DEFAULT_SPEND_LIMITS,Date.now(),{job,context:{payload:resolved.payload,creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined)}});
+        if(task.data.creator === moderator.address) throw new ModerationRejectError(409,'Moderator must not be the fee payer.');
+        store.enqueueIntake(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS,job,{payload:resolved.payload,creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined)});
       }
       return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator.address,attestation:null,policyHash:moderationPolicyHashHex(),pending:true,jobId:store.intakeJob(params.task,target)!.id,retryAfterSeconds:5};
     }
@@ -538,23 +470,31 @@ export async function attestTask(deps: AttestDeps, params: {
   if(reviewed && (reviewed.body.genesisHash !== genesisHash || reviewed.body.creator !== task.data.creator || reviewed.body.cluster !== (deps.cluster ?? 'mainnet'))) throw new ModerationRejectError(409,'Review context changed.');
   const [pda] = moderator ? await findTaskModerationPda({task:taskAddr,jobSpecHash:resolved.specHashBytes,moderator:moderator.address}) : [null];
   const readRecord = async () => pda ? await fetchMaybeTaskModeration(rpc,pda) : null;
-  const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === result.policyHash && toHex(record.data.scannerHash as Uint8Array) === effectiveScannerHash && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000));
+  const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.riskScore === scan.riskScore && record.data.categoryMask === BigInt(scan.categoryMask) && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === result.policyHash && toHex(record.data.scannerHash as Uint8Array) === effectiveScannerHash && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000));
   let record = await readRecord();
+  let cachedPayment: ModerationResult|undefined;
   if(existing?.result && existing.hash === target && existing.expires > Date.now()) {
     const cached = JSON.parse(existing.result) as ModerationResult;
     const cachedBody = cached.signedVerdict?.body;
-    if(cachedBody?.policyHash !== result.policyHash || cachedBody.scannerHash !== effectiveScannerHash || cachedBody.genesisHash !== genesisHash || cachedBody.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS) throw new ModerationRejectError(409,'Policy changed; operator review required.');
-    if(existing.state === 'held' || usable(record)) return cached;
+    if(cachedBody?.policyHash !== result.policyHash || cachedBody.scannerHash !== effectiveScannerHash || cachedBody.genesisHash !== genesisHash || cachedBody.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS || cachedBody.creator !== task.data.creator || cached.moderator !== (moderator?.address ?? null)) throw new ModerationRejectError(409,'Policy or creator changed; operator review required.');
+    if(existing.state === 'held') return cached;
+    if(usable(record)) return confirmPayment(deps,params.task,target,cached);
+    if(record?.exists || existing.state === 'confirmed') throw new ModerationRejectError(409,'Confirmed record changed or disappeared.');
+    if(cached.transaction && cached.lastValidBlockHeight !== undefined) {
+      if(await rpc.getBlockHeight({commitment:'confirmed'}).send() <= BigInt(cached.lastValidBlockHeight)) return cached;
+      cachedPayment=cached;
+    }
   }
-  if(existing && ['reserved','pending'].includes(existing.state) && !usable(record)) return {...result,pending:true,...(queuedJob ? {jobId:queuedJob.id,retryAfterSeconds:5}:{}),recordPda:pda ?? undefined,attestation:existing.signature ? {signature:existing.signature,recordedAt:new Date().toISOString(),expiresAt:null} : null};
+  // Never automatically replace legacy R-paid reservations after upgrade.
+  if(existing && ['reserved','pending'].includes(existing.state) && !usable(record)) throw new ModerationRejectError(409,'Legacy payment needs reconciliation.');
   store.admit(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS);
   let retrievability: SpecRetrievability | undefined;
-  let expires = Math.min(Math.floor(Date.now()/1000)*1000+72*3600000,reviewed ? Date.parse(String(reviewed.body.expiresAt)):Infinity);
+  let expires = cachedPayment ? existing!.expires : Math.min(Math.floor(Date.now()/1000)*1000+72*3600000,reviewed ? Date.parse(String(reviewed.body.expiresAt)):Infinity);
   if(scan.verdict === 'clean' && moderator && pda) {
     result.recordPda = pda;
     if(usable(record) && record?.exists) {
       expires = Math.min(Number(record.data.expiresAt)*1000,expires);
-      result.attestation = {signature:existing?.signature ?? '',recordedAt:new Date(Number(record.data.recordedAt)*1000).toISOString(),expiresAt:new Date(expires).toISOString()};
+      result.attestation = {signature:await recordSignature(deps.rpcUrl,pda,record.data),recordedAt:new Date(Number(record.data.recordedAt)*1000).toISOString(),expiresAt:new Date(expires).toISOString()};
     } else {
       if(record?.exists) throw new ModerationRejectError(409,'Existing on-chain record requires operator review.');
       const mode = await resolveSignerMode(rpc,moderator);
@@ -568,22 +508,91 @@ export async function attestTask(deps: AttestDeps, params: {
       if(latestPinned.exists && toHex(latestPinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Pin changed.');
       record = await readRecord();
       if(record?.exists) throw new ModerationRejectError(409,'Record appeared; retry read.');
-      const sent = await signAndSend(deps.rpcUrl,instruction,moderator,{store,task:params.task,reserve:(cost,balance)=>store.reserve(params.task,target,task.data.creator,cost,balance,deps.spendLimits ?? DEFAULT_SPEND_LIMITS)});
-      result.attestation = {signature:sent.signature,recordedAt:new Date().toISOString(),expiresAt:new Date(expires).toISOString()};
-      if(sent.pending) return {...result,pending:true,...(queuedJob ? {jobId:queuedJob.id,retryAfterSeconds:5}:{})};
+      store.assertPaymentCapacity(params.task,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS);
+      const price=cachedPayment ? {priceLamports:cachedPayment.priceLamports!,rentLamports:cachedPayment.rentLamports!,serviceFeeLamports:cachedPayment.serviceFeeLamports!} : await readPaymentPrice(deps.rpcUrl,deps.attestationServiceFeeLamports ?? 0);
+      Object.assign(result,await buildPaymentOffer(deps.rpcUrl,task.data.creator,moderator,pda,instruction,price));
     }
   }
   if(retrievability) Object.assign(result,attestedRetrievabilityFields(retrievability));
   const issuedAt = new Date().toISOString();
-  const body: Record<string,unknown> = {...(reviewed?.body ?? {}),v:1,kind:'task-intake',cluster:deps.cluster ?? 'mainnet',genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,taskPda:params.task,creator:task.data.creator,jobSpecHash:target,jobSpecUri:retrievability?.specRegistryUri ?? params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : null),policyHash:result.policyHash,scannerHash:effectiveScannerHash,verdict:scan.verdict,riskScore:scan.riskScore,categories:scan.categories ?? [],reasons:scan.reasons ?? (scan.truncated ? ['INPUT_LIMIT'] : []),record:{moderator:result.moderator,pda:result.attestation ? pda : null,txSignature:result.attestation?.signature || null},issuedAt,expiresAt:new Date(expires).toISOString(),nonce:randomBytes(16).toString('hex'),keyId};
+  const body: Record<string,unknown> = {...(reviewed?.body ?? {}),v:1,kind:'task-intake',cluster:deps.cluster ?? 'mainnet',genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,taskPda:params.task,creator:task.data.creator,jobSpecHash:target,jobSpecUri:retrievability?.specRegistryUri ?? params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : null),policyHash:result.policyHash,scannerHash:effectiveScannerHash,verdict:scan.verdict,riskScore:scan.riskScore,categories:scan.categories ?? [],reasons:scan.reasons ?? (scan.truncated ? ['INPUT_LIMIT'] : []),payment:result.priceLamports !== undefined ? {recordPda:pda,priceLamports:result.priceLamports,payer:task.data.creator} : null,record:{moderator:result.moderator,pda:scan.verdict === 'clean' ? pda : null,txSignature:result.attestation?.signature || null},issuedAt,expiresAt:new Date(expires).toISOString(),nonce:randomBytes(16).toString('hex'),keyId};
   if(repo && typeof repo === 'object' && !Array.isArray(repo)) {
     const r = repo as Record<string,unknown>;
     body.repo = Object.fromEntries(repoFields.map(f=>[f,r[f]]));
   }
-  result.signedVerdict = signDocument(body,key);
-  if(reviewed) store.releaseQueuedSpend(params.task);
+  result.signedVerdict = cachedPayment?.signedVerdict ?? signDocument(body,key);
+  if(result.transaction) {
+    const offer=store.saveOffer(params.task,target,task.data.creator,result,expires,deps.spendLimits ?? DEFAULT_SPEND_LIMITS,existing?.result);
+    if(queuedJob && reviewed) store.finishJob(queuedJob.id,offer,expires);
+    return offer;
+  }
   if(store.get(params.task)?.state === 'pending') store.finish(params.task,result,expires);
   else store.saveVerdict(params.task,target,task.data.creator,result,expires);
   if(queuedJob && reviewed) store.finishJob(queuedJob.id,result,expires);
   return result;
+}
+
+/** Obtain an actual confirmed signature from PDA history; never invent a receipt. */
+async function recordSignature(rpcUrl: string, pda: string, record: TaskModeration): Promise<string> {
+  const rpc=createSolanaRpc(rpcUrl);
+  const history=await rpc.getSignaturesForAddress(address(pda),{commitment:'confirmed',limit:20}).send();
+  for(const receipt of history) {
+    if(receipt.err !== null) continue;
+    const tx=await rpc.getTransaction(solanaSignature(receipt.signature),{commitment:'confirmed',encoding:'json',maxSupportedTransactionVersion:0}).send();
+    if(!tx || !tx.meta || tx.meta.err !== null) continue;
+    const message=tx.transaction.message;
+    const keys=[...message.accountKeys,...(tx.meta.loadedAddresses?.writable ?? []),...(tx.meta.loadedAddresses?.readonly ?? [])];
+    for(const ix of message.instructions) {
+      if(keys[ix.programIdIndex] !== AGENC_COORDINATION_PROGRAM_ADDRESS || keys[ix.accounts[1]] !== record.task ||
+         keys[ix.accounts[2]] !== record.moderator || keys[ix.accounts[3]] !== pda) continue;
+      try {
+        const bytes=base58Decode(ix.data);
+        if(!Buffer.from(bytes.subarray(0,8)).equals(Buffer.from(getRecordTaskModerationDiscriminatorBytes()))) continue;
+        const data=getRecordTaskModerationInstructionDataDecoder().decode(bytes);
+        if(Buffer.from(data.jobSpecHash).equals(Buffer.from(record.jobSpecHash)) && data.status===record.status &&
+           data.riskScore===record.riskScore && data.categoryMask===record.categoryMask && data.expiresAt===record.expiresAt &&
+           Buffer.from(data.policyHash).equals(Buffer.from(record.policyHash)) && Buffer.from(data.scannerHash).equals(Buffer.from(record.scannerHash))) return receipt.signature;
+      } catch { /* Unrelated instruction: continue looking for the record receipt. */ }
+    }
+  }
+  throw new ModerationRejectError(502,'Confirmed record signature unavailable.');
+}
+async function confirmPayment(deps:AttestDeps,task:string,hash:string,result:ModerationResult):Promise<ModerationResult> {
+  if(result.attestation) return result;
+  const {key,keyId}=authorizedVerdictKey(result.moderator);
+  const body=result.signedVerdict!.body;
+  const record=await fetchMaybeTaskModeration(createSolanaRpc(deps.rpcUrl),address(result.recordPda!));
+  if(!record.exists || !recordMatches(record.data,result,task,hash)) throw new ModerationRejectError(409,'Record binding changed.');
+  const signature=await recordSignature(deps.rpcUrl,result.recordPda!,record.data);
+  const paid={...result};
+  delete paid.transaction;delete paid.lastValidBlockHeight;
+  paid.attestation={signature,recordedAt:new Date(Number(record.data.recordedAt)*1000).toISOString(),expiresAt:String(body.expiresAt)};
+  paid.signedVerdict=signDocument({...body,keyId,record:{...(body.record as Record<string,unknown>),txSignature:signature}},key);
+  const store=deps.store ?? getStore();
+  store.saveVerdict(task,hash,String(body.creator),paid,Date.parse(String(body.expiresAt)));
+  const job=store.intakeJob(task,hash);if(job) store.finishJob(job.id,paid,Date.parse(String(body.expiresAt)));
+  return paid;
+}
+/** GET only reconciles a paid record; it never creates or reissues transactions. */
+export async function getStoredAttestation(deps:AttestDeps,task:string,hash:string):Promise<ModerationResult|undefined> {
+  const saved=(deps.store ?? getStore()).get(task);
+  if(!saved?.result || saved.hash!==hash || saved.expires<=Date.now()) return undefined;
+  const result=JSON.parse(saved.result) as ModerationResult;
+  if(result.verdict !== 'clean' || !result.recordPda) return result;
+  const record=await fetchMaybeTaskModeration(createSolanaRpc(deps.rpcUrl),address(result.recordPda));
+  if(!record.exists) {
+    if(result.attestation) throw new ModerationRejectError(409,'Confirmed record disappeared.');
+    return result;
+  }
+  if(!recordMatches(record.data,result,task,hash))
+    throw new ModerationRejectError(409,'Confirmed record binding mismatch.');
+  return confirmPayment(deps,task,hash,result);
+}
+
+function recordMatches(record:TaskModeration,result:ModerationResult,task:string,hash:string):boolean {
+  const b=result.signedVerdict!.body;
+  return record.status===0 && record.task===task && record.creator===b.creator && record.moderator===result.moderator &&
+    Buffer.from(record.jobSpecHash).toString('hex')===hash && Buffer.from(record.policyHash).toString('hex')===b.policyHash &&
+    Buffer.from(record.scannerHash).toString('hex')===b.scannerHash && record.riskScore===result.riskScore &&
+    record.expiresAt>=BigInt(Math.floor(Date.parse(String(b.expiresAt))/1000)) && record.expiresAt>BigInt(Math.floor(Date.now()/1000));
 }
