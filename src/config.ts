@@ -34,6 +34,13 @@ export interface ServiceConfig {
    * NOT kit-entitlement gating — any key holder is a first-class caller.
    */
   apiKeys: string[];
+  /**
+   * Optional bearer keys required ONLY on the task routes
+   * (`/v1/moderation/tasks`, `/api/task-moderation/attest`), where each new
+   * (task, hash) pair makes the signer pay record rent. Listing intake is
+   * bounded to one record per listing and stays open.
+   */
+  taskApiKeys: string[];
   /** Per-IP requests per window for POST endpoints. */
   rateLimitPerIp: number;
   /**
@@ -74,6 +81,10 @@ export function loadConfig(): ServiceConfig {
       DEFAULT_ATTESTATION_TTL_SECONDS,
     ),
     apiKeys: (process.env.ATTEST_API_KEYS ?? "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean),
+    taskApiKeys: (process.env.ATTEST_TASK_API_KEYS ?? "")
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean),

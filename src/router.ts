@@ -120,13 +120,16 @@ function attestErrorResponse(error: unknown): Response {
 }
 
 /** POST gate: API key (when configured) then rate limit. Returns a Response to short-circuit, or null to proceed. */
-async function gatePost(config: ServiceConfig, request: Request): Promise<Response | null> {
-  if (config.apiKeys.length > 0) {
-    const header = request.headers.get("authorization") ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-    if (!token || !config.apiKeys.includes(token)) {
-      return errorJson(401, "This deployment requires an API key (Authorization: Bearer <key>).");
-    }
+const TASK_ROUTES = new Set(["/v1/moderation/tasks", "/api/task-moderation/attest"]);
+
+async function gatePost(config: ServiceConfig, request: Request, path: string): Promise<Response | null> {
+  const header = request.headers.get("authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (config.apiKeys.length > 0 && (!token || !config.apiKeys.includes(token))) {
+    return errorJson(401, "This deployment requires an API key (Authorization: Bearer <key>).");
+  }
+  if (TASK_ROUTES.has(path) && config.taskApiKeys.length > 0 && (!token || !config.taskApiKeys.includes(token))) {
+    return errorJson(401, "Task attestation requires an API key (Authorization: Bearer <key>).");
   }
   const decision = await rateLimit(config, clientIp(request));
   if (!decision.allowed) {
@@ -368,7 +371,7 @@ export function createModerationApi(configOverride?: Partial<ServiceConfig>): Fe
       }
 
       if (request.method === "POST") {
-        const gate = await gatePost(config, request);
+        const gate = await gatePost(config, request, path);
         if (gate) return gate;
         if (path === "/v1/moderation/listings") return await handleListings(config, request);
         if (path === "/v1/moderation/tasks") return await handleTasks(config, request);
