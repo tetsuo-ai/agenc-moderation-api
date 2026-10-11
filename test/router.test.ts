@@ -232,6 +232,25 @@ describe("gates", () => {
     expect(allowed.status).toBe(422);
   });
 
+  it("requires a task key on the task routes only when ATTEST_TASK_API_KEYS is configured", async () => {
+    const handler = createModerationApi({ taskApiKeys: ["tk"] });
+    const task = "9UEu2Gv9Q7DwBtumR2rUSq5g8v7b6mxn26ZNQCky82RJ";
+    for (const path of ["/v1/moderation/tasks", "/api/task-moderation/attest"]) {
+      const denied = await handler(post(path, { task }));
+      expect(denied.status).toBe(401);
+      const wrong = await handler(post(path, { task }, { authorization: "Bearer nope" }));
+      expect(wrong.status).toBe(401);
+    }
+    const allowed = await handler(
+      post("/v1/moderation/tasks", { task, spec: { t: "x" }, jobSpecHash: "ab".repeat(32) }, { authorization: "Bearer tk" }),
+    );
+    // Past the task key gate; fails later at the hash binding (422), not 401.
+    expect(allowed.status).toBe(422);
+    // Listing intake is not gated by the task key.
+    const listing = await handler(post("/v1/moderation/listings", { listing: task }));
+    expect(listing.status).not.toBe(401);
+  });
+
   it("rate limits per IP and globally", async () => {
     const handler = createModerationApi({
       rateLimitPerIp: 2,
