@@ -1,4 +1,4 @@
-import { check, LIMITS, type Check, type TreeEntry } from './types.js';
+import { check, INFRA_HOLD, LIMITS, type Check, type TreeEntry } from './types.js';
 export interface Dependency { name: string; version: string; ecosystem: 'npm' | 'PyPI' | 'crates.io' }
 export interface LockScan { checks: Check[]; dependencies: Dependency[]; npmSupported: boolean }
 export const LOCKFILES = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|requirements[^/]*\.txt|poetry\.lock|uv\.lock|Pipfile\.lock)$/;
@@ -52,7 +52,7 @@ export async function checkOsv(deps: Dependency[], query: OsvQuery): Promise<Che
     const ids: string[] = [];
     for (let i=0;i<deps.length;i+=100) ids.push(...parseOsv(await query(deps.slice(i,i+100)),Math.min(100,deps.length-i)));
     return check('osv',ids.length ? 'hold' : 'pass',...ids);
-  } catch { return check('osv','hold','OSV unavailable, malformed or paginated'); }
+  } catch { return check('osv','hold',INFRA_HOLD.osv); }
 }
 export function newDependencies(before: Dependency[], after: Dependency[]): Dependency[] {
   const existing = new Set(before.map(d=>`${d.ecosystem}:${d.name}@${d.version}`));

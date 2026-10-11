@@ -4,11 +4,11 @@ import { address, createSolanaRpc } from '@solana/kit';
 import { fetchMaybeTask, fetchMaybeTaskJobSpec, fetchMaybeTaskSubmission, fetchMaybeTaskClaim,
   findTaskJobSpecPda, findTaskSubmissionPda } from '@tetsuo-ai/marketplace-sdk';
 import { attestTask, loadModeratorSigner, type AttestDeps, type ModerationResult } from './signer.js';
-import { getStore, DEFAULT_SPEND_LIMITS, type QueueContext, type StoredJob } from './store.js';
+import { getStore, DEFAULT_SPEND_LIMITS, retryAfterSeconds, type QueueContext, type StoredJob } from './store.js';
 import { loadKeyManifest, type SignedDocument } from './verdict.js';
 import { ModerationRejectError } from './errors.js';
 import { reviewWorkerReport, type RepoReviewContext } from './repo-review.js';
-import { IMAGE, objectHash, validateJob, type Job, type Report } from '../worker/types.js';
+import { IMAGE, infrastructureHold, objectHash, validateJob, type Job, type Report } from '../worker/types.js';
 import { verifyReport } from '../worker/protocol.js';
 import { processJob, type WorkerDeps } from '../worker/consumer.js';
 
@@ -16,7 +16,10 @@ export interface DeliverableResult { verdict: import('./scan.js').Verdict; moder
 function deliverableResult(reviewed:SignedDocument):DeliverableResult {
   return {verdict:reviewed.body.verdict as DeliverableResult['verdict'],moderator:(reviewed.body.record as {moderator:string|null}).moderator,attestation:null,signedVerdict:reviewed};
 }
-export const pendingJob = (job:StoredJob) => ({pending:true as const,jobId:job.id,retryAfterSeconds:5});
+/** Waits before a job whose report only said infrastructure failed runs again. After the
+ * last one the hold is kept as the final answer, so a repo cannot force endless scans. */
+export const RETRY_DELAYS_MS = [60_000, 180_000, 600_000] as const;
+export const pendingJob = (job:StoredJob) => ({pending:true as const,jobId:job.id,retryAfterSeconds:retryAfterSeconds(job)});
 function settings(deps:AttestDeps) {
   if(!deps.repository || !IMAGE.test(deps.repository.imageDigest) || !Object.keys(deps.repository.workers).length) throw new ModerationRejectError(503,'Worker configuration required.');
   return deps.repository;
@@ -100,14 +103,20 @@ export async function acceptQueuedReport(deps:AttestDeps,workerId:string,input:{
     moderator:moderator.address,intakeKeys:intakeKeys(),resolveContext:job=>contextFor(deps,stored,job),
     consumeNonce:(worker,value)=>{nonce={worker,value};}},input.report);
   await contextFor(deps,stored,validateJob(input.report.body.job));
+  // A GitHub, OSV or Podman outage is not a finding about the repo: scan again later.
+  const attempt=stored.attempts ?? 0;
+  const retry=reviewed.body.verdict === 'suspicious' && infrastructureHold(reviewed.body.checks as Report['checks']) && attempt < RETRY_DELAYS_MS.length;
   // Another report may have won while the independent reads were in flight.
   store.db.exec('BEGIN IMMEDIATE');
   try {
     const current=store.job(stored.id)!;
     if(current.state !== 'leased' || current.lease !== input.leaseToken || current.leaseUntil<=Date.now()) throw new ModerationRejectError(409,'Lease changed.');
     store.consumeNonce('report:'+nonce!.worker,nonce!.value);
-    store.saveReview(stored.id,reviewed,input.report);store.db.exec('COMMIT');
+    if(retry) store.retryJob(stored.id,Date.now()+RETRY_DELAYS_MS[attempt]!);
+    else store.saveReview(stored.id,reviewed,input.report);
+    store.db.exec('COMMIT');
   } catch(e) { store.db.exec('ROLLBACK');throw e; }
+  if(retry) { store.audit('repo-retry',{jobId:stored.id,attempt:attempt+1}); return {accepted:true,jobId:stored.id}; }
   if(input.report.body.job.kind==='deliverable') {
     const result=deliverableResult(reviewed);
     store.finishJob(stored.id,result,Date.parse(String(reviewed.body.expiresAt)));

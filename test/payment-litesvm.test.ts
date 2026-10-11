@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { address, createKeyPairSignerFromBytes, decompileTransactionMessage,
   getCompiledTransactionMessageDecoder, getTransactionDecoder, lamports, partiallySignTransaction,
   type Address, type Instruction, type Transaction } from '@solana/kit';
-import { facade, findCompletionBondPda, findTaskPda, getTaskModerationDecoder, getTaskModerationSize, values } from '@tetsuo-ai/marketplace-sdk';
+import { facade, findCompletionBondPda, findTaskModerationPda, findTaskPda, getTaskModerationDecoder, getTaskModerationSize, values } from '@tetsuo-ai/marketplace-sdk';
 import { startLocalMarketplace, type LocalMarketplace } from '@tetsuo-ai/marketplace-sdk/testing';
 import { FailedTransactionMetadata, type LiteSVM } from 'litesvm';
 import { base58Encode } from '../src/base58.js';
@@ -86,6 +86,23 @@ it.each([0,12345])('executes the API offer against the compiled program; R never
  await market.client.send([await facade.closeTask({task,authority:market.payer,creatorCompletionBond,taskJobSpec:null,
   children:[{kind:'namedRecipient',account:address(result.recordPda!),recipient:R.address}]})]);
  expect(market.svm.getBalance(R.address)).toBe(moderatorBefore+rent+BigInt(fee));expect(market.svm.getAccount(address(result.recordPda!)).exists).toBe(false);
+ expect(rpcState.sendCalls).toBe(0);
+});
+it('attests over a record address someone pre-funded, and R still never loses',async()=>{
+ const [pda]=await findTaskModerationPda({task,jobSpecHash:Buffer.from(hash,'hex'),moderator:R.address});
+ const prefund=market.svm.minimumBalanceForRentExemption(0n);
+ market.svm.airdrop(pda,lamports(prefund));
+ const griefed=market.svm.getAccount(pda);expect(griefed.exists && griefed.programAddress).toBe('11111111111111111111111111111111');
+ const moderatorBefore=market.svm.getBalance(R.address)!;
+ const result=await attestTask(deps(),{task,jobSpecHash:hash,spec:PAYLOAD});
+ expect(result.recordPda).toBe(pda);expect(result.transaction).toEqual(expect.any(String));
+ const signed=await coSign(result.transaction!);const execution=market.svm.sendTransaction(signed);
+ if(execution instanceof FailedTransactionMetadata) throw Error(execution.err()+'\n'+execution.meta().logs().join('\n'));
+ journalReceipt(signed,execution.signature());
+ const account=market.svm.getAccount(pda);if(!account.exists) throw Error('Record missing');
+ expect(account.data.length).toBe(getTaskModerationSize());expect(getTaskModerationDecoder().decode(account.data).moderator).toBe(R.address);
+ expect(market.svm.getBalance(R.address)!).toBeGreaterThanOrEqual(moderatorBefore);
+ expect((await getStoredAttestation(deps(),task,hash))?.attestation?.signature).toBe(rpcState.signature);
  expect(rpcState.sendCalls).toBe(0);
 });
 it('real program failure rolls back the transfer and preserves R balance',async()=>{

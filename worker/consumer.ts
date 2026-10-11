@@ -1,6 +1,6 @@
 import type { KeyObject } from 'node:crypto';
 import type { SignedDocument } from '../src/verdict.js';
-import { check, decision, hash, IMAGE, objectHash, validateJob, type Artifact, type Job, type Report } from './types.js';
+import { check, decision, hash, IMAGE, INFRA_HOLD, objectHash, validateJob, type Artifact, type Job, type Report } from './types.js';
 import { scannerHash } from './rules.js';
 import { scanTree } from './tree.js';
 import { checkOsv, newDependencies, parseLocks, type OsvQuery } from './dependencies.js';
@@ -58,7 +58,7 @@ export async function processJob(input: Job, deps: WorkerDeps): Promise<SignedDo
             try {
               const headTree = await deps.github.headTree(job.github,artifact.manifest.headCommit);
               report.checks.push(check('head-binding',headTree === applied.snapshot.treeSha ? 'pass':'reject'));
-            } catch { report.checks.push(check('head-binding','hold','Head commit unavailable or ancestry unverifiable')); }
+            } catch { report.checks.push(check('head-binding','hold',INFRA_HOLD.head)); }
             if (decision(report.checks) === 'pass' && next.npmSupported) {
               report.tests = await sandbox.test(job.github);
               report.checks.push(check('tests',report.tests.exitCode === 0 && !report.tests.timedOut ? 'pass':'reject',
@@ -68,10 +68,10 @@ export async function processJob(input: Job, deps: WorkerDeps): Promise<SignedDo
         }
       }
     }
-  } catch { report.checks.push(check('worker-error','hold','Incomplete worker check; untrusted details omitted')); }
+  } catch { report.checks.push(check('worker-error','hold',INFRA_HOLD.worker)); }
   finally {
     try { await sandbox?.close(); }
-    catch { report.checks.push(check('cleanup','hold','Sandbox cleanup failed')); }
+    catch { report.checks.push(check('cleanup','hold',INFRA_HOLD.cleanup)); }
   }
   report.verdict = decision(report.checks);
   Object.assign(report,reportTimes(deps.now?.()));

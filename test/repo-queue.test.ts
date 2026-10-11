@@ -1,10 +1,11 @@
 /** End-to-end HTTP + durable SQLite + real worker/signatures. Every RPC,
  * GitHub, registry and container boundary is mocked; no live transactions. */
 import { generateKeyPairSync, sign, verify } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { getTransactionDecoder, getCompiledTransactionMessageDecoder, decompileTransactionMessage } from '@solana/kit';
-import { values, parseRecordTaskModerationInstruction, findModerationAttestorPda } from '@tetsuo-ai/marketplace-sdk';
+import { AGENC_COORDINATION_PROGRAM_ADDRESS, values, parseRecordTaskModerationInstruction, findModerationAttestorPda } from '@tetsuo-ai/marketplace-sdk';
 import { base58Encode } from '../src/base58.js';
 import { installPayerFixture, installVerdictFixture, creatorFixture, recordReceipt } from './fixtures.js';
 import { AttestationStore, DEFAULT_SPEND_LIMITS } from '../src/store.js';
@@ -38,7 +39,7 @@ vi.mock('@tetsuo-ai/marketplace-sdk',async original=>({...await original<typeof 
 }));
 import { createModerationApi } from '../src/router.js';
 import { type AttestDeps } from '../src/signer.js';
-import { runDevelopmentWorkerOnce } from '../src/repo-queue.js';
+import { RETRY_DELAYS_MS, runDevelopmentWorkerOnce } from '../src/repo-queue.js';
 import { __resetRateLimiterForTests } from '../src/rate-limit.js';
 import { processJob, type WorkerDeps } from '../worker/consumer.js';
 import { signQueueRequest, runHttpWorkerOnce } from '../worker/queue-http.js';
@@ -72,6 +73,16 @@ async function review(leaseData:Awaited<ReturnType<typeof lease>>,report?:Awaite
 async function acceptedIntake() { expect((await intake()).status).toBe(202);expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);expect((await get()).status).toBe(200); }
 function deliverable() { return post('/v1/moderation/deliverables',{task:TASK,submissionPda:SUBMISSION,artifactSha256:hash(ARTIFACT_BYTES)}); }
 function readySubmission() { state.pinned=true;state.status=2;state.workers=1; }
+/** Run every retry of an infrastructure hold: the intake stays pending and no job runs before its time. */
+async function exhaustRetries() {
+ for(let i=0;i<RETRY_DELAYS_MS.length;i++) {
+  const pending=await (await intake()).json();expect(pending).toMatchObject({pending:true});
+  expect(pending.retryAfterSeconds).toBeGreaterThanOrEqual(RETRY_DELAYS_MS[i]!/1000-1);
+  expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(false);
+  store.db.prepare("UPDATE jobs SET leaseUntil=0 WHERE state='retry'").run();
+  expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ }
+}
 beforeEach(async()=>{
  fixture=installVerdictFixture();payer=installPayerFixture();creator=creatorFixture();store=new AttestationStore(join(fixture.directory,'queue.sqlite'));
  Object.assign(state,{creator:creator.address,moderator:payer.address,hash:(await values.canonicalJobSpecHash(PAYLOAD)).hex,
@@ -104,10 +115,25 @@ it('queues HTTP intake, worker pulls/posts, and returns a verifiable repo-bound 
  expect((await (await get()).json()).signedVerdict).toEqual(done.signedVerdict);expect(state.events).toEqual([]);expect(spend()).toEqual({n:0,total:0});
  expect(await runHttpWorkerOnce('https://signer.test',worker,fetcher)).toBe(false);
 });
+// The real answer for a GitHub-bound task, for the AgenC Desktop tests
+// (tests/fixtures/marketplace/attestor/github-intake.json there). Runs only on demand:
+//   EXPORT_DESKTOP_GITHUB_FIXTURE=/path/github-intake.json npx vitest run test/repo-queue.test.ts -t "Desktop fixture"
+it.runIf(!!process.env.EXPORT_DESKTOP_GITHUB_FIXTURE)('exports the Desktop fixture for a GitHub-bound intake',async()=>{
+ await intake();expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ const response=await intake();const text=await response.text();const body=JSON.parse(text).signedVerdict.body;
+ expect(body).toMatchObject({kind:'task-intake',scope:'repository',verdict:'clean',record:{pda:expect.any(String)}});
+ writeFileSync(process.env.EXPORT_DESKTOP_GITHUB_FIXTURE!,JSON.stringify({
+  note:'Real POST /v1/moderation/tasks answer for a job spec with custom.github: HTTP intake, worker report and attestTask from agenc-moderation-api test/repo-queue.test.ts. Throwaway keys; RPC, GitHub and the container are mocked.',
+  now:Date.now(),rootPublicKey:keyAddress(fixture.root.privateKey),manifest:fixture.manifest,
+  context:{task:TASK,creator:creator.address,jobSpecHash:state.hash,jobSpecUri:body.jobSpecUri ?? 'https://spec.test',rosterKey:payer.address,
+   chain:{cluster:'mainnet',genesisHash:'genesis-test',programId:AGENC_COORDINATION_PROGRAM_ADDRESS}},
+  status:response.status,text},null,2)+'\n');
+});
 it.each(['hold','reject'])('stores %s reasons without an on-chain record or spend',async outcome=>{
  if(outcome==='hold') box.clone.mockRejectedValue(Error('mock sandbox outage'));
  else box.clone.mockResolvedValue({treeSha:TREE,entries:[...cleanTree(),entry('src/secret','-----BEGIN PRIVATE KEY-----')]});
  await intake();expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ if(outcome==='hold') await exhaustRetries();
  const res=await intake();expect(res.status).toBe(200);const result=await res.json();
  expect(result.verdict).toBe(outcome==='hold'?'suspicious':'blocked');expect(result.signedVerdict.body.reasons.length).toBeGreaterThan(0);
  expect(result.attestation).toBeNull();expect(result.signedVerdict.body.record.pda).toBeNull();expect((await get()).status).toBe(200);
@@ -193,8 +219,20 @@ it('requires accepted intake and caps deliverable scanner admissions',async()=>{
 it.each(['hold','reject'])('stores negative GitHub %s reports even without immutable repo facts',async outcome=>{
  const negative=outcome==='hold' ? github(()=>{throw Error('GitHub offline');}) : github(url=>url.includes('/license?')?{license:{spdx_id:'GPL-3.0'}}:undefined);
  deps.repository!.github=negative;worker.github=negative;handler=api();await intake();await runDevelopmentWorkerOnce(deps,worker);
+ if(outcome==='hold') await exhaustRetries();
  const done=await (await get()).json();expect(done.verdict).toBe(outcome==='hold'?'suspicious':'blocked');expect(done.signedVerdict.body.repo).toBeNull();
  expect(done.signedVerdict.body.reasons.length).toBeGreaterThan(0);expect(spend().n).toBe(0);expect(state.events).toEqual([]);
+});
+it('scans again after a transient outage and attests the repo once it recovers',async()=>{
+ box.clone.mockRejectedValueOnce(Error('mock sandbox outage'));
+ await intake();expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ expect((await get()).status).toBe(404);
+ const pending=await (await intake()).json();expect(pending).toMatchObject({pending:true});expect(pending.retryAfterSeconds).toBeGreaterThan(50);
+ store.db.prepare("UPDATE jobs SET leaseUntil=0 WHERE state='retry'").run();
+ expect(await runDevelopmentWorkerOnce(deps,worker)).toBe(true);
+ const done=await (await intake()).json();
+ expect(done.signedVerdict.body).toMatchObject({verdict:'clean',scope:'repository'});expect(done.transaction).toEqual(expect.any(String));
+ expect(store.db.prepare('SELECT attempts FROM jobs').get()).toEqual({attempts:1});
 });
 it('reuses the originally admitted creator authorization and checks the current creator',async()=>{
  const target=state.hash;state.hash='a'.repeat(64);

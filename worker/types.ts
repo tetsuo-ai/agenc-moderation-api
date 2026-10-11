@@ -43,6 +43,20 @@ export const LICENSES = ['MIT', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'I
 export function hash(value: Buffer | string): string { return createHash('sha256').update(value).digest('hex'); }
 export function objectHash(value: unknown): string { return hash(canonicalJson(value)); }
 export function check(id: string, verdict: Decision, ...reasons: string[]): Check { return { id, verdict, reasons }; }
+/** Hold reasons that mean a check could not run (GitHub, OSV, Podman), not that the repo is risky. */
+export const INFRA_HOLD = Object.freeze({
+  worker: 'Incomplete worker check; untrusted details omitted',
+  github: 'GitHub unavailable or incomplete facts',
+  osv: 'OSV unavailable, malformed or paginated',
+  cleanup: 'Sandbox cleanup failed',
+  head: 'Head commit unavailable or ancestry unverifiable',
+});
+const INFRA_REASONS: ReadonlySet<string> = new Set(Object.values(INFRA_HOLD));
+/** True when the only checks that did not pass are holds caused by infrastructure. */
+export function infrastructureHold(checks: Check[]): boolean {
+  const open = checks.filter(c => c.verdict !== 'pass');
+  return open.length > 0 && open.every(c => c.verdict === 'hold' && c.reasons.length > 0 && c.reasons.every(r => INFRA_REASONS.has(r)));
+}
 export function decision(checks: Check[]): Decision {
   return checks.some(c => c.verdict === 'reject') ? 'reject' : checks.some(c => c.verdict === 'hold') ? 'hold' : 'pass';
 }

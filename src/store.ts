@@ -6,7 +6,7 @@ import type { Job } from '../worker/types.js';
 import type { CreatorAuthorization } from './binding.js';
 import type { SignedDocument } from './verdict.js';
 export interface QueueContext { payload: Record<string,unknown>; creator: string; specUri?: string; authenticatedCreator: boolean; creatorAuthorization?: CreatorAuthorization }
-export interface StoredJob { id: string; binding: string; task: string; hash: string; kind: string; job: string; context: string; state: string; worker: string|null; lease: string|null; leaseUntil: number; reviewed: string|null; report: string|null; result: string|null; expires: number }
+export interface StoredJob { id: string; binding: string; task: string; hash: string; kind: string; job: string; context: string; state: string; worker: string|null; lease: string|null; leaseUntil: number; reviewed: string|null; report: string|null; result: string|null; expires: number; attempts: number }
 
 import { ModerationRejectError } from './errors.js';
 export interface StoredIntake {
@@ -45,6 +45,9 @@ export class AttestationStore {
       CREATE TABLE IF NOT EXISTS admissions(id INTEGER PRIMARY KEY, task TEXT, hash TEXT, creator TEXT, at INTEGER);
       CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, binding TEXT UNIQUE NOT NULL, task TEXT NOT NULL, hash TEXT NOT NULL, kind TEXT NOT NULL, job TEXT NOT NULL, context TEXT NOT NULL, state TEXT NOT NULL, worker TEXT, lease TEXT, leaseUntil INTEGER NOT NULL DEFAULT 0, reviewed TEXT, report TEXT, result TEXT, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, at INTEGER, event TEXT, detail TEXT);`);
+        // Stores created before retries existed have no attempts column.
+        const columns = this.db.prepare('PRAGMA table_info(jobs)').all() as {name: string}[];
+        if (!columns.some(c => c.name === 'attempts')) this.db.exec('ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
     }
     get(task: string): StoredIntake | undefined { return this.db.prepare('SELECT * FROM intakes WHERE task=?').get(task) as unknown as StoredIntake | undefined; }
     audit(event: string, detail: unknown): void { this.db.prepare('INSERT INTO audit(at,event,detail) VALUES(?,?,?)').run(Date.now(), event, JSON.stringify(detail)); }
@@ -157,10 +160,15 @@ export class AttestationStore {
     leaseJob(worker: string, now=Date.now()): StoredJob|undefined {
         this.db.exec('BEGIN IMMEDIATE');
         try {
-            const next=this.db.prepare("SELECT id FROM jobs WHERE (state='queued' OR (state='leased' AND leaseUntil<=?)) AND expires>? ORDER BY rowid LIMIT 1").get(now,now) as {id:string}|undefined;
+            // A job waiting to retry keeps its not-before time in leaseUntil.
+            const next=this.db.prepare("SELECT id FROM jobs WHERE (state='queued' OR (state IN ('leased','retry') AND leaseUntil<=?)) AND expires>? ORDER BY rowid LIMIT 1").get(now,now) as {id:string}|undefined;
             if(next) this.db.prepare("UPDATE jobs SET state='leased',worker=?,lease=?,leaseUntil=? WHERE id=?").run(worker,randomBytes(24).toString('hex'),now+15*60000,next.id);
             this.db.exec('COMMIT'); return next ? this.job(next.id):undefined;
         } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    }
+    /** Put a leased job back in the queue after a report that only says infrastructure failed. */
+    retryJob(id: string, notBefore: number): void {
+        this.db.prepare("UPDATE jobs SET state='retry',worker=NULL,lease=NULL,leaseUntil=?,attempts=attempts+1 WHERE id=?").run(notBefore,id);
     }
     saveReview(id: string, reviewed: SignedDocument, report: unknown): void {
         this.db.prepare("UPDATE jobs SET state='reviewed',reviewed=?,report=? WHERE id=?").run(JSON.stringify(reviewed),JSON.stringify(report),id);
@@ -169,6 +177,10 @@ export class AttestationStore {
         this.db.prepare("UPDATE jobs SET state='done',result=?,expires=? WHERE id=?").run(JSON.stringify(result),expires,id);
     }
     close(): void { this.db.close(); }
+}
+/** Seconds a client should wait before asking about a queued job again. */
+export function retryAfterSeconds(job: StoredJob): number {
+    return job.state === 'retry' ? Math.max(5, Math.ceil((job.leaseUntil - Date.now()) / 1000)) : 5;
 }
 const stores = new Map<string, AttestationStore>();
 export function getStore(path = process.env.ATTESTATION_DB_PATH ?? './data/attestations.sqlite'): AttestationStore {

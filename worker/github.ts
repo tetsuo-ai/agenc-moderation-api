@@ -1,4 +1,4 @@
-import { check, hash, LICENSES, LIMITS, SHA40, type Check, type GithubSpec, type RepoFacts } from './types.js';
+import { check, hash, INFRA_HOLD, LICENSES, LIMITS, SHA40, type Check, type GithubSpec, type RepoFacts } from './types.js';
 import { licenseFromFile } from './rules.js';
 import { jsonTransport, type JsonRequest } from './http.js';
 
@@ -57,7 +57,7 @@ export class GithubClient {
       return { checks, licenseFile:bytes, facts:{id:id!,owner:spec.owner,name:spec.repo,licenseSpdx:spdx!,
         baseCommit:spec.baseCommit,treeSha:commit.tree.sha,defaultBranch:meta.default_branch,licenseFileSha256:hash(bytes)} };
     } catch {
-      return {checks:[...checks,check(GITHUB_CHECKS[checks.length] ?? 'github-commit','hold','GitHub unavailable or incomplete facts')],facts:null,licenseFile:null};
+      return {checks:[...checks,check(GITHUB_CHECKS[checks.length] ?? 'github-commit','hold',INFRA_HOLD.github)],facts:null,licenseFile:null};
     }
   }
 }

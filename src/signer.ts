@@ -7,13 +7,14 @@ import { assertJsonDepth } from './json-depth.js';
 
 import { readFileSync } from "node:fs";
 import { bindRequester, type CreatorAuthorization } from "./binding.js";
-import { getStore, DEFAULT_SPEND_LIMITS, type AttestationStore, type SpendLimits } from "./store.js";
+import { getStore, DEFAULT_SPEND_LIMITS, retryAfterSeconds, type AttestationStore, type SpendLimits } from "./store.js";
 import { authorizedVerdictKey, signDocument, type SignedDocument } from "./verdict.js";
 import { createHash, randomBytes } from "node:crypto";
 import {
   address,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
+  fetchEncodedAccount,
   signature as solanaSignature,
   type Address,
   type Instruction,
@@ -449,7 +450,8 @@ export async function attestTask(deps: AttestDeps, params: {
         if(task.data.creator === moderator.address) throw new ModerationRejectError(409,'Moderator must not be the fee payer.');
         store.enqueueIntake(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS,job,{payload:resolved.payload,creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization,specUri:params.specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined)});
       }
-      return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator.address,attestation:null,policyHash:moderationPolicyHashHex(),pending:true,jobId:store.intakeJob(params.task,target)!.id,retryAfterSeconds:5};
+      const pendingIntake=store.intakeJob(params.task,target)!;
+      return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator.address,attestation:null,policyHash:moderationPolicyHashHex(),pending:true,jobId:pendingIntake.id,retryAfterSeconds:retryAfterSeconds(pendingIntake)};
     }
   }
   const repoFields = ['id','owner','name','licenseSpdx','baseCommit','treeSha','allowedPathsHash','maxDiffBytes','testCommandHash'];
@@ -469,7 +471,7 @@ export async function attestTask(deps: AttestDeps, params: {
   const genesisHash = await rpc.getGenesisHash().send();
   if(reviewed && (reviewed.body.genesisHash !== genesisHash || reviewed.body.creator !== task.data.creator || reviewed.body.cluster !== (deps.cluster ?? 'mainnet'))) throw new ModerationRejectError(409,'Review context changed.');
   const [pda] = moderator ? await findTaskModerationPda({task:taskAddr,jobSpecHash:resolved.specHashBytes,moderator:moderator.address}) : [null];
-  const readRecord = async () => pda ? await fetchMaybeTaskModeration(rpc,pda) : null;
+  const readRecord = async () => pda ? await fetchModerationRecord(rpc,pda) : null;
   const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.riskScore === scan.riskScore && record.data.categoryMask === BigInt(scan.categoryMask) && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === result.policyHash && toHex(record.data.scannerHash as Uint8Array) === effectiveScannerHash && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000));
   let record = await readRecord();
   let cachedPayment: ModerationResult|undefined;
@@ -532,6 +534,19 @@ export async function attestTask(deps: AttestDeps, params: {
   return result;
 }
 
+const SYSTEM_PROGRAM_ADDRESS = '11111111111111111111111111111111';
+/** Anyone can send lamports to the record address before it exists. That account stays
+ * System-owned with no data, the program still creates the record over it, so it counts as
+ * absent. Any other account that does not decode is still an error. */
+async function fetchModerationRecord(rpc: ReturnType<typeof createSolanaRpc>, pda: Address) {
+  try { return await fetchMaybeTaskModeration(rpc,pda); }
+  catch (error) {
+    const raw = await fetchEncodedAccount(rpc,pda);
+    if(raw.exists && raw.programAddress === SYSTEM_PROGRAM_ADDRESS && raw.data.length === 0) return {exists:false as const,address:pda};
+    throw error;
+  }
+}
+
 /** Obtain an actual confirmed signature from PDA history; never invent a receipt. */
 async function recordSignature(rpcUrl: string, pda: string, record: TaskModeration): Promise<string> {
   const rpc=createSolanaRpc(rpcUrl);
@@ -561,7 +576,7 @@ async function confirmPayment(deps:AttestDeps,task:string,hash:string,result:Mod
   if(result.attestation) return result;
   const {key,keyId}=authorizedVerdictKey(result.moderator);
   const body=result.signedVerdict!.body;
-  const record=await fetchMaybeTaskModeration(createSolanaRpc(deps.rpcUrl),address(result.recordPda!));
+  const record=await fetchModerationRecord(createSolanaRpc(deps.rpcUrl),address(result.recordPda!));
   if(!record.exists || !recordMatches(record.data,result,task,hash)) throw new ModerationRejectError(409,'Record binding changed.');
   const signature=await recordSignature(deps.rpcUrl,result.recordPda!,record.data);
   const paid={...result};
@@ -579,7 +594,7 @@ export async function getStoredAttestation(deps:AttestDeps,task:string,hash:stri
   if(!saved?.result || saved.hash!==hash || saved.expires<=Date.now()) return undefined;
   const result=JSON.parse(saved.result) as ModerationResult;
   if(result.verdict !== 'clean' || !result.recordPda) return result;
-  const record=await fetchMaybeTaskModeration(createSolanaRpc(deps.rpcUrl),address(result.recordPda));
+  const record=await fetchModerationRecord(createSolanaRpc(deps.rpcUrl),address(result.recordPda));
   if(!record.exists) {
     if(result.attestation) throw new ModerationRejectError(409,'Confirmed record disappeared.');
     return result;
