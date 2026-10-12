@@ -1,0 +1,264 @@
+{
+ "schemaVersion": 1,
+ "kind": "agenc.marketplace.jobSpec",
+ "title": "Fix average() dividing by one less than the number of values",
+ "shortDescription": "Fix a bug in the public repository signerless/agenc-e2e-sandbox.",
+ "fullDescription": "average() in src/stats.js divides the sum by values.length - 1, so average([2, 4, 6]) returns 6 instead of 4. Divide by values.length, keep returning 0 for an empty list, and add tests for average() in test/stats.test.js.\nRepository: https://github.com/signerless/agenc-e2e-sandbox (license MIT).\nBase commit: 14220e8663c6668f08f2c3750129e8fc2d81fae1.\nWork type: bug.\nChange only these paths: src/stats.js, test/stats.test.js.\nKeep the total diff under 204800 bytes.\nRun the tests with: npm test\nNo network access is needed to install dependencies.\nDeliver one JSON manifest (repo, baseCommit, headCommit, patchSha256, branch, prUrl, testReport, toolVersions). Its SHA-256 digest is the proof you submit.",
+ "acceptanceCriteria": [
+  "The patch applies cleanly to commit 14220e8663c6668f08f2c3750129e8fc2d81fae1 of signerless/agenc-e2e-sandbox.",
+  "This command passes: npm test",
+  "Only these paths change: src/stats.js, test/stats.test.js.",
+  "The diff is at most 204800 bytes.",
+  "average([2, 4, 6]) returns 4",
+  "average([]) returns 0",
+  "test/stats.test.js has tests for average() and npm test passes"
+ ],
+ "deliverables": [
+  "One JSON manifest with these fields: repo, baseCommit, headCommit, patchSha256, branch, prUrl, testReport, toolVersions."
+ ],
+ "constraints": null,
+ "attachments": [],
+ "custom": {
+  "github": {
+   "allowedPaths": [
+    "src/stats.js",
+    "test/stats.test.js"
+   ],
+   "baseCommit": "14220e8663c6668f08f2c3750129e8fc2d81fae1",
+   "license": "MIT",
+   "maxDiffBytes": 204800,
+   "needsNetworkForInstall": false,
+   "owner": "signerless",
+   "repo": "agenc-e2e-sandbox",
+   "testCommand": "npm test",
+   "workType": "bug"
+  }
+ },
+ "context": {},
+ "execution": {
+  "acceptanceCriteria": [
+   {
+    "description": "The patch applies cleanly to commit 14220e8663c6668f08f2c3750129e8fc2d81fae1 of signerless/agenc-e2e-sandbox.",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.1",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "This command passes: npm test",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.2",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "Only these paths change: src/stats.js, test/stats.test.js.",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.3",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "The diff is at most 204800 bytes.",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.4",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "average([2, 4, 6]) returns 4",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.5",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "average([]) returns 0",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.6",
+    "required": true,
+    "type": "manual_text_review"
+   },
+   {
+    "description": "test/stats.test.js has tests for average() and npm test passes",
+    "evidenceRefs": [
+     "output.1"
+    ],
+    "id": "criterion.7",
+    "required": true,
+    "type": "manual_text_review"
+   }
+  ],
+  "artifactPolicy": [
+   {
+    "allowedKinds": [
+     "file",
+     "https_uri"
+    ],
+    "allowedRemoteHosts": [],
+    "durableStorageGuaranteed": false,
+    "id": "artifact.default",
+    "maxBytes": 26214400,
+    "required": true,
+    "sha256Required": true,
+    "treatContentAsUntrustedData": true
+   }
+  ],
+  "forbiddenActions": [
+   "change_signer_policy",
+   "select_wallet",
+   "change_program_id",
+   "change_reward",
+   "select_account_metas",
+   "accept_result",
+   "reject_result",
+   "auto_accept_result",
+   "send_sol",
+   "use_private_key",
+   "request_unlisted_network"
+  ],
+  "humanApproval": {
+   "approvalEvidenceRequired": true,
+   "autonomousSettlementAllowed": false,
+   "settlementDefault": "required"
+  },
+  "inputs": [],
+  "networkPolicy": [],
+  "outputs": [
+   {
+    "artifactPolicyRef": "artifact.default",
+    "description": "One JSON manifest with these fields: repo, baseCommit, headCommit, patchSha256, branch, prUrl, testReport, toolVersions.",
+    "id": "output.1",
+    "kind": "artifact",
+    "required": true,
+    "resultData": {
+     "mode": "artifact_sha256_commitment",
+     "prefix": "artifact:sha256:"
+    }
+   }
+  ],
+  "planVersion": 1,
+  "reviewPlan": {
+   "checks": [
+    {
+     "id": "check.jobSpecHash",
+     "kind": "job_spec_hash_matches_on_chain",
+     "required": true
+    },
+    {
+     "id": "check.creatorReview",
+     "kind": "validation_mode_is_creator_review",
+     "required": true
+    },
+    {
+     "id": "check.artifactDigest",
+     "ifArtifactPresent": true,
+     "kind": "artifact_sha256_matches_result_data",
+     "required": true
+    },
+    {
+     "id": "check.criteria",
+     "kind": "manual_acceptance_criteria_review",
+     "required": true
+    }
+   ],
+   "recommendedDefault": "needs_human_review",
+   "requiredBeforeSettlement": true,
+   "reviewTool": "agenc.market.prepareSubmissionReview"
+  },
+  "sandbox": {
+   "allowedToolGroups": [
+    "filesystem.read",
+    "filesystem.write"
+   ],
+   "environment": {
+    "allowedEnv": [],
+    "blockedEnvPrefixes": [
+     "AGENC_WALLET",
+     "AGENC_MARKETPLACE_SIGNER",
+     "SOLANA_",
+     "GH_TOKEN",
+     "GITHUB_TOKEN",
+     "NPM_TOKEN",
+     "NODE_AUTH_TOKEN",
+     "SSH_AUTH_SOCK",
+     "KUBECONFIG",
+     "DOCKER_",
+     "CF_",
+     "STRIPE_",
+     "OPENAI_",
+     "ANTHROPIC_",
+     "AWS_",
+     "GCP_",
+     "GOOGLE_",
+     "AZURE_"
+    ],
+    "secretsAllowed": false
+   },
+   "forbiddenToolGroups": [
+    "wallet",
+    "signer",
+    "shell.unsafe",
+    "browser.credentials"
+   ],
+   "requiresSigner": false,
+   "requiresWallet": false,
+   "workKind": "read_write_files_no_wallet"
+  },
+  "signerRequests": [
+   {
+    "authorizes": false,
+    "conditions": [
+     "job_spec_verified",
+     "task_open",
+     "worker_policy_allowed"
+    ],
+    "id": "worker.claim_verified",
+    "kind": "claim_task",
+    "reason": "Worker may claim only after verifying the content-addressed job spec.",
+    "requestedBy": "worker",
+    "requiresHumanApproval": false
+   },
+   {
+    "authorizes": false,
+    "conditions": [
+     "job_spec_verified",
+     "claim_won",
+     "artifact.sha256_computed"
+    ],
+    "id": "worker.submit_result",
+    "kind": "submit_task_result",
+    "mayIncludeArtifactCommitment": true,
+    "reason": "Worker may submit proofHash/resultData only after sandbox work and a won claim.",
+    "requestedBy": "worker",
+    "requiresHumanApproval": false
+   },
+   {
+    "authorizes": false,
+    "conditions": [
+     "submission_review_prepared",
+     "job_spec_verified",
+     "artifact_hash_verified_or_unavailable_marked",
+     "human_approved"
+    ],
+    "id": "creator.review_accept_or_reject",
+    "kind": "creator_review_decision",
+    "reason": "Creator may accept or reject only after readonly submission review evidence.",
+    "requestedBy": "creator",
+    "requiresHumanApproval": true
+   }
+  ]
+ }
+}

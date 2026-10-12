@@ -1,3 +1,6 @@
+import { authorizedVerdictKey } from './verdict.js';
+import { getStore } from './store.js';
+import { randomUUID } from 'node:crypto';
 /**
  * Self-host entrypoint: a plain Node HTTP server around the same fetch handler
  * the hosted deployment runs. `npx @tetsuo-ai/agenc-moderation-api` or
@@ -16,6 +19,11 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
   const handler = createModerationApi();
   const config = loadConfig();
 
+  getStore(config.storePath);
+  if(process.env.NODE_ENV === 'production') {
+    const signer = await loadModeratorSigner();
+    authorizedVerdictKey(signer.address);
+  }
   let signerLine = "signer: NOT CONFIGURED (verdict-only mode — no attestations will be recorded)";
   try {
     const signer = await loadModeratorSigner();
@@ -29,11 +37,12 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
       .then((response) => writeWebResponse(res, response))
       .catch(() => {
         res.statusCode = 500;
-        res.end('{"ok":false,"error":"internal error"}');
+        const logId=randomUUID();console.error(JSON.stringify({event:'adapter-failed',logId}));
+        res.end(JSON.stringify({ok:false,moderator:null,error:'Internal error.',logId}));
       });
   });
 
-  await new Promise<void>((resolve) => server.listen(port, resolve));
+  await new Promise<void>((resolve) => server.listen(port, process.env.HOST ?? "127.0.0.1", resolve));
   console.log(`[${SERVICE_NAME}] v${SERVICE_VERSION} listening on :${port}`);
   console.log(`[${SERVICE_NAME}] rpc: ${config.rpcUrl} (${config.cluster})`);
   console.log(`[${SERVICE_NAME}] ${signerLine}`);

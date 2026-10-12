@@ -1,27 +1,21 @@
-/**
- * HTTP surface (WinterCG fetch handler — runs unchanged on Vercel functions
- * and the self-host Node adapter).
- *
- * PUBLIC endpoints (CORS-open; POST endpoints are rate-limited and optionally
- * API-keyed — plain bearer keys, NOT kit-entitlement gating):
- *
- *   POST /v1/moderation/listings   { listing, spec? | specUri? }
- *   POST /v1/moderation/tasks      { task, jobSpecHash?, spec? | specUri? }
- *   POST /api/task-moderation/attest   (compatibility: store-core remote
- *        attestor + agenc.ag proxy shapes) → { attested, moderation, txSignature }
- *   GET  /v1/policy      the exact policy bytes (sha256 == policy_hash)
- *   GET  /v1/info        service identity: signer pubkey, cluster, hashes, TTL
- *   GET  /v1/health      liveness
- *   GET  /openapi.json   the OpenAPI document
- */
+import { scannerHash as repositoryScannerHash } from '../worker/rules.js';
+import { enqueueDeliverable, acceptQueuedReport } from './repo-queue.js';
+import { verifyQueueRequest, type QueueRequest } from '../worker/queue-http.js';
+import type { SignedDocument } from './verdict.js';
+import { randomUUID } from 'node:crypto';
+import { assertJsonDepth } from './json-depth.js';
+import { getStore } from './store.js';
+import { loadKeyManifest } from './verdict.js';
+import type { CreatorAuthorization } from './binding.js';
+/** Desktop attestor HTTP surface; POST never advertises CORS. */
 
 import { normalizeTaskModerationInput } from "@tetsuo-ai/marketplace-moderation";
 import { loadConfig, type ServiceConfig } from "./config.js";
-import { clientIp, limiterMode, rateLimit } from "./rate-limit.js";
+import { clientIp, limiterMode, rateKey, rateLimit, type RateScope } from "./rate-limit.js";
 import { MAX_BODY_BYTES } from "./limits.js";
 import {
-  attestListing,
   attestTask,
+  getStoredAttestation,
   loadModeratorSigner,
   ModerationRejectError,
   ModerationSignerUnavailableError,
@@ -37,27 +31,21 @@ import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 const PDA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 
-const CORS_HEADERS: Record<string, string> = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
-  "access-control-max-age": "86400",
-};
-
 function json(body: unknown, status = 200, extra?: Record<string, string>): Response {
-  return new Response(JSON.stringify(body), {
+  return new Response(JSON.stringify(body && typeof body === "object" && !Array.isArray(body) ? {moderator:null,...body} : body), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
-      ...CORS_HEADERS,
       ...extra,
     },
   });
 }
 
-function errorJson(status: number, message: string, extra?: Record<string, unknown>): Response {
-  return json({ ok: false, error: message, ...extra }, status);
+function errorJson(status: number, _message: string, extra?: Record<string, unknown>): Response {
+  const logId = typeof extra?.logId === 'string' ? extra.logId : randomUUID();
+  console.error(JSON.stringify({logId,event:'request-refused',status}));
+  return json({ ok: false, error: 'Request could not be completed.', logId, ...extra }, status);
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
@@ -89,6 +77,9 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new ModerationRejectError(400, "Body must be a JSON object.");
   }
+  assertJsonDepth(parsed);
+  const preflight = (parsed as Record<string,unknown>).preflightOnly;
+  if(preflight !== undefined && typeof preflight !== 'boolean') throw new ModerationRejectError(400,'preflightOnly must be boolean.');
   return parsed as Record<string, unknown>;
 }
 
@@ -103,20 +94,21 @@ function optionalObject(value: unknown): Record<string, unknown> | undefined {
 }
 
 /** Map attest-core errors to HTTP responses; unexpected errors → retryable 502. */
-function attestErrorResponse(error: unknown): Response {
-  if (error instanceof ModerationSignerUnavailableError) {
-    return errorJson(503, error.message);
-  }
-  if (error instanceof SpecNotRetrievableError) {
-    // Fail-closed retrievability refusal — retryable once the spec is hosted.
-    return errorJson(error.httpStatus, error.message, { code: error.code, retryable: true });
-  }
-  if (error instanceof ModerationRejectError) {
-    return errorJson(error.httpStatus, error.message);
-  }
-  return errorJson(502, error instanceof Error ? error.message : "Moderation failed.", {
-    retryable: true,
-  });
+function attestErrorResponse(error: unknown, config: ServiceConfig): Response {
+  const logId = randomUUID();
+  const status = error instanceof ModerationRejectError ? error.httpStatus : error instanceof SpecNotRetrievableError ? error.httpStatus : error instanceof ModerationSignerUnavailableError ? 503 : 502;
+  console.error(JSON.stringify({logId,event:'request-failed',type:error instanceof Error ? error.name : 'Error',status}));
+  try { getStore(config.storePath).audit('request-failed',{logId,status,type:error instanceof Error ? error.name : 'Error'}); } catch { /* Error response must work when the DB is unavailable. */ }
+  return errorJson(status,'Request could not be completed.',{logId,...(error instanceof SpecNotRetrievableError ? {code:error.code,retryable:true} : {})});
+}
+
+/** Rate gate for one scope. Returns a 429 to short-circuit, or null to proceed. */
+async function gateRate(config: ServiceConfig, request: Request, scope: RateScope): Promise<Response | null> {
+  const decision = await rateLimit(config, rateKey(clientIp(request)), scope);
+  if (decision.allowed) return null;
+  const response = errorJson(429,'Request rate exceeded.',{retryAfterSeconds:decision.retryAfterSeconds});
+  response.headers.set('retry-after',String(decision.retryAfterSeconds));
+  return response;
 }
 
 /** POST gate: API key (when configured) then rate limit. Returns a Response to short-circuit, or null to proceed. */
@@ -128,53 +120,27 @@ async function gatePost(config: ServiceConfig, request: Request): Promise<Respon
       return errorJson(401, "This deployment requires an API key (Authorization: Bearer <key>).");
     }
   }
-  const decision = await rateLimit(config, clientIp(request));
-  if (!decision.allowed) {
-    const message =
-      decision.deniedBy === "global"
-        ? "The service-wide attestation ceiling for this window is exhausted. Retry shortly."
-        : decision.deniedBy === "shared-store-error"
-          ? "Rate-limit store temporarily unavailable; requests are paused to protect the signer. Retry shortly."
-          : "Too many requests from this address. Retry shortly.";
-    return new Response(JSON.stringify({ ok: false, error: message, retryAfterSeconds: decision.retryAfterSeconds }), {
-      status: 429,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
-        "retry-after": String(decision.retryAfterSeconds),
-        ...CORS_HEADERS,
-      },
-    });
-  }
-  return null;
+  return gateRate(config, request, 'post');
 }
 
 /* ------------------------------- handlers -------------------------------- */
 
 function attestDeps(config: ServiceConfig): AttestDeps {
   return {
+    repository: config.repositoryImageDigest ? {imageDigest:config.repositoryImageDigest,workers:config.repositoryWorkers}:undefined,
     rpcUrl: config.rpcUrl,
     attestationTtlSeconds: config.attestationTtlSeconds,
     jobSpecRegistryUrl: config.jobSpecRegistryUrl,
     jobSpecRegistryToken: config.jobSpecRegistryToken,
+    pinEnabled: config.pinEnabled,
+    cluster: config.cluster,
+    store: getStore(config.storePath),
+    spendLimits: config.spendLimits,
+    attestationServiceFeeLamports: config.attestationServiceFeeLamports,
   };
 }
 
-async function handleListings(config: ServiceConfig, request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const listing = optionalString(body.listing) ?? optionalString(body.listingPda);
-  if (!listing || !PDA_RE.test(listing)) {
-    return errorJson(400, "Provide a valid listing PDA (listing).");
-  }
-  const result = await attestListing(attestDeps(config), {
-    listing,
-    spec: optionalObject(body.spec),
-    specUri: optionalString(body.specUri),
-  });
-  return json({ ok: true, attested: result.attestation !== null, ...result });
-}
-
-async function handleTasks(config: ServiceConfig, request: Request): Promise<Response> {
+async function handleTasks(config: ServiceConfig, request: Request, overrides: Partial<AttestDeps> = {}): Promise<Response> {
   const body = await readJsonBody(request);
   const task = optionalString(body.task) ?? optionalString(body.taskPda);
   if (!task || !PDA_RE.test(task)) {
@@ -184,13 +150,15 @@ async function handleTasks(config: ServiceConfig, request: Request): Promise<Res
   if (jobSpecHash && !HASH_RE.test(jobSpecHash)) {
     return errorJson(400, "jobSpecHash must be 64 hex chars.");
   }
-  const result = await attestTask(attestDeps(config), {
+  const result = await attestTask({...attestDeps(config),...overrides}, {
     task,
     jobSpecHash,
+    creatorAuthorization: optionalObject(body.creatorAuthorization) as unknown as CreatorAuthorization | undefined,
+    preflightOnly: body.preflightOnly === true,
     spec: optionalObject(body.spec),
     specUri: optionalString(body.specUri),
   });
-  return json({ ok: true, attested: result.attestation !== null, ...result });
+  return json({ ok: true, attested: result.attestation !== null && !result.pending, ...result },result.pending ? 202 : 200);
 }
 
 /**
@@ -207,14 +175,15 @@ async function handleTasks(config: ServiceConfig, request: Request): Promise<Res
  * `jobSpecHash` (the hash the task will pin). Responds with the kit-backend
  * shape `{ attested, moderation, txSignature }`.
  */
-async function handleCompatAttest(config: ServiceConfig, request: Request): Promise<Response> {
+async function handleCompatAttest(config: ServiceConfig, request: Request, overrides: Partial<AttestDeps> = {}): Promise<Response> {
   const body = await readJsonBody(request);
   const task = optionalString(body.taskPda) ?? optionalString(body.task);
   const jobSpecHash = optionalString(body.jobSpecHash)?.toLowerCase();
   if (!task || !PDA_RE.test(task)) return errorJson(400, "Invalid taskPda.");
   if (!jobSpecHash || !HASH_RE.test(jobSpecHash)) return errorJson(400, "Invalid jobSpecHash.");
 
-  const text = optionalString(body.text) ?? optionalString(body.jobSpecCanonicalJson);
+  const rawString = (value: unknown) => typeof value === 'string' && value.trim() ? value : undefined;
+  const text = rawString(body.text) ?? rawString(body.jobSpecCanonicalJson);
   const jobSpecObject = optionalObject(body.jobSpec) ?? optionalObject(body.spec);
   let payloadHashFromText: string | null = null;
 
@@ -236,6 +205,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return errorJson(422, "Spec text must be a JSON object.");
     }
+    assertJsonDepth(parsed);
     spec = parsed as Record<string, unknown>;
     rawText = text;
     // Kit-backend parity detail for the response's moderation object: the
@@ -258,17 +228,26 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
   // truth for what gets scanned), but the URI feeds the retrievability gate's
   // candidate list — a spec hosted there passes without being force-routed
   // through the registry pin path.
-  const result = await attestTask(attestDeps(config), {
+  const result = await attestTask({...attestDeps(config),...overrides}, {
     task,
     jobSpecHash,
+    creatorAuthorization: optionalObject(body.creatorAuthorization) as unknown as CreatorAuthorization | undefined,
+    preflightOnly: body.preflightOnly === true,
     spec,
     specUri: optionalString(body.jobSpecUri),
     rawText,
   });
   return json({
     ok: true,
-    attested: result.attestation !== null,
+    attested: result.attestation !== null && !result.pending,
+    moderator: result.moderator,
+    verdict: result.verdict,
+    ...(result.signedVerdict ? {signedVerdict:result.signedVerdict} : {}),
+    ...(result.preflightOnly ? {preflightOnly:true,wouldAttest:result.wouldAttest} : {}),
+    ...(result.pending ? {pending:true,jobId:result.jobId,retryAfterSeconds:result.retryAfterSeconds} : {}),
     moderation: {
+      status: result.verdict,
+      moderator: result.moderator,
       verdict: result.verdict,
       riskScore: result.riskScore,
       specHash: result.specHash,
@@ -277,6 +256,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
       expiresAt: result.attestation?.expiresAt ?? null,
       ...(payloadHashFromText ? { payloadHash: payloadHashFromText } : {}),
     },
+    ...Object.fromEntries(['transaction','lastValidBlockHeight','priceLamports','rentLamports','serviceFeeLamports','recordPda'].filter(k=>k in result).map(k=>[k,result[k as keyof ModerationResult]])),
     txSignature: result.attestation?.signature ?? null,
     ...(result.attestation
       ? {
@@ -285,7 +265,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
           specRegistryUri: result.specRegistryUri,
         }
       : {}),
-  });
+  },result.pending ? 202 : 200);
 }
 
 async function handleInfo(config: ServiceConfig): Promise<Response> {
@@ -308,22 +288,30 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
     policyHash: moderationPolicyHashHex(),
     scannerHash: scannerHashHex(),
     scannerDescriptor: SCANNER_DESCRIPTOR,
+    repository: {enabled:!!config.repositoryImageDigest && Object.keys(config.repositoryWorkers).length>0,imageDigest:config.repositoryImageDigest,scannerHash:config.repositoryImageDigest ? repositoryScannerHash(config.repositoryImageDigest):null},
     attestationTtlSeconds: config.attestationTtlSeconds,
     // The retrievability gate: every attestation implies retrievable content.
     jobSpecRegistry: {
       url: config.jobSpecRegistryUrl,
-      pinCredential: config.jobSpecRegistryToken ? "registry-token" : "wallet-upload-ticket",
+      pinEnabled:config.pinEnabled,
+      pinCredential: config.pinEnabled && config.jobSpecRegistryToken ? "registry-token" : "disabled",
     },
+    creatorLimits: {dailyIntakes:config.spendLimits.dailyIntakes,hourlyTasks:config.spendLimits.hourlyTasks,outstandingTransactions:config.spendLimits.outstandingTransactions},
+    attestationServiceFeeLamports: config.attestationServiceFeeLamports,
     apiKeyRequired: config.apiKeys.length > 0,
     rateLimit: {
       mode: limiterMode(config),
       perIp: config.rateLimitPerIp,
       global: config.rateLimitGlobal,
       windowMs: config.rateLimitWindowMs,
+      get: {perIp:config.rateLimitGetPerIp,global:config.rateLimitGetGlobal},
     },
     endpoints: [
-      "POST /v1/moderation/listings",
+      "GET /v1/keys",
+      "GET /v1/attestations/:task/:hash",
       "POST /v1/moderation/tasks",
+      "POST /v1/moderation/deliverables",
+      "GET /v1/deliverable-reviews/:task/:submission/:artifact",
       "POST /api/task-moderation/attest",
       "GET /v1/policy",
       "GET /v1/info",
@@ -338,48 +326,89 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
 export type FetchHandler = (request: Request) => Promise<Response>;
 
 /** Build the service's fetch handler. `configOverride` is a test seam. */
-export function createModerationApi(configOverride?: Partial<ServiceConfig>): FetchHandler {
-  return async function handle(request: Request): Promise<Response> {
+export function createModerationApi(configOverride?: Partial<ServiceConfig>, overrides: Partial<AttestDeps> = {}): FetchHandler {
+  const handle = async function(request: Request): Promise<Response> {
     const config: ServiceConfig = { ...loadConfig(), ...configOverride };
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: {"access-control-allow-origin":"*","access-control-allow-methods":"GET, OPTIONS"} });
     }
 
     try {
       if (request.method === "GET") {
         if (path === "/v1/health") return json({ ok: true });
-        if (path === "/v1/info") return handleInfo(config);
         if (path === "/v1/policy") {
           return new Response(new Uint8Array(moderationPolicyBytes()), {
             status: 200,
             headers: {
               "content-type": "text/markdown; charset=utf-8",
               "cache-control": "public, max-age=300",
-              ...CORS_HEADERS,
             },
           });
         }
         if (path === "/openapi.json") return json(openApiDocument());
-        if (path === "/" ) return handleInfo(config);
+        // The key list is one small file every client needs to check a verdict: never rate limited.
+        if (path === '/v1/keys') return json({ok:true,manifest:loadKeyManifest()});
+        // Everything below reads the store or the RPC, or hashes the scanner bundle, so it is rate limited.
+        const gate = await gateRate(config, request, 'get');
+        if (gate) return gate;
+        const match = /^\/v1\/attestations\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
+        if(match) {
+          const result=await getStoredAttestation({...attestDeps(config),...overrides},match[1],match[2]);
+          if(!result) return errorJson(404,'Attestation unavailable.');
+          return json({ok:true,attested:result.attestation !== null,...result});
+        }
+        const deliverable=/^\/v1\/deliverable-reviews\/([^/]+)\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
+        if(deliverable) {
+          const stored=(overrides.store ?? getStore(config.storePath)).deliverableJob(deliverable[1],deliverable[2],deliverable[3]);
+          if(!stored?.result || stored.expires<=Date.now()) return errorJson(404,'Review unavailable.');
+          return json({ok:true,attested:false,...JSON.parse(stored.result)});
+        }
+        if (path === "/v1/info" || path === "/") return handleInfo(config);
         return errorJson(404, `Unknown path ${path}. See GET /v1/info for the endpoint list.`);
       }
 
       if (request.method === "POST") {
+        if(path === '/internal/worker/pull' || path === '/internal/worker/reports') {
+          const deps={...attestDeps(config),...overrides};
+          if(!deps.repository || !Object.keys(deps.repository.workers).length) return errorJson(503,'Worker unavailable.');
+          const envelope=await readJsonBody(request) as unknown as SignedDocument<QueueRequest>;
+          let auth:QueueRequest;
+          try { auth=verifyQueueRequest(envelope,path,deps.repository.workers); }
+          catch { return errorJson(403,'Worker authentication refused.'); }
+          const store=deps.store ?? getStore(config.storePath);
+          store.consumeNonce('transport:'+auth.workerId,auth.nonce);
+          if(path === '/internal/worker/pull') {
+            const lease=store.leaseJob(auth.workerId);
+            return lease ? json({jobId:lease.id,leaseToken:lease.lease,leaseExpiresAt:new Date(lease.leaseUntil).toISOString(),job:JSON.parse(lease.job)}) : new Response(null,{status:204});
+          }
+          return json(await acceptQueuedReport(deps,auth.workerId,auth.payload as unknown as Parameters<typeof acceptQueuedReport>[2]));
+        }
         const gate = await gatePost(config, request);
         if (gate) return gate;
-        if (path === "/v1/moderation/listings") return await handleListings(config, request);
-        if (path === "/v1/moderation/tasks") return await handleTasks(config, request);
-        if (path === "/api/task-moderation/attest") return await handleCompatAttest(config, request);
+        if (path === "/v1/moderation/listings") return errorJson(410,"Task intake only.");
+        if (path === "/v1/moderation/tasks") return await handleTasks(config, request, overrides);
+        if (path === '/v1/moderation/deliverables') {
+          const body=await readJsonBody(request);
+          if(typeof body.task !== 'string' || !PDA_RE.test(body.task) || typeof body.submissionPda !== 'string' || !PDA_RE.test(body.submissionPda) || typeof body.artifactSha256 !== 'string' || !HASH_RE.test(body.artifactSha256)) return errorJson(400,'Invalid deliverable binding.');
+          const result=await enqueueDeliverable({...attestDeps(config),...overrides},body as {task:string;submissionPda:string;artifactSha256:string});
+          return json({ok:true,attested:false,...result},result.pending ? 202:200);
+        }
+        if (path === "/api/task-moderation/attest") return await handleCompatAttest(config, request, overrides);
         return errorJson(404, `Unknown path ${path}. See GET /v1/info for the endpoint list.`);
       }
 
       return errorJson(405, "Method not allowed.");
     } catch (error) {
-      return attestErrorResponse(error);
+      return attestErrorResponse(error,config);
     }
+  };
+  return async request => {
+    const response = await handle(request);
+    if(request.method === 'GET') response.headers.set('access-control-allow-origin','*');
+    return response;
   };
 }
 

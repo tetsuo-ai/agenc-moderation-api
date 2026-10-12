@@ -1,16 +1,4 @@
-/**
- * Deterministic moderation scanner (`task-safety-policy-v1`).
- *
- * Ported rule-for-rule from the agenc.ag first-party signer
- * (`agenc-ag/apps/web/lib/server/moderation-signer.ts`), whose rules were in
- * turn ported verbatim from the storefront reference
- * (`agenc-services-storefront/server/verifiedTasks.ts`). The scan is
- * deliberately deterministic (regex deny rules, no ML): identical input text
- * always produces the identical verdict, so a verifier can re-run it.
- *
- * The scanner NEVER attests partially-scanned content: exceeding the text-input
- * cap degrades to `blocked` (a hold), not to a pass.
- */
+/** Deterministic desktop intake scan over normalized keys and values. */
 
 import { createHash } from "node:crypto";
 
@@ -113,63 +101,57 @@ const POLICY_RULES: PolicyRule[] = [
       /\b(?:read|write|modify|delete)\s+(?:local\s+)?(?:files?|filesystem|home\s+directory)\b/i,
     ],
   },
+  {ruleId:'ROLE_OVERRIDE',severity:'reject',category:'role_override',categoryBit:1n<<6n,patterns:[/\b(?:system|developer|assistant)\s*:\s*/i, /(?:act|behave)\s+as\s+(?:a\s+)?(?:system|developer|unrestricted)/i, /you\s+are\s+now/i]},
+  {ruleId:'SIGNER_POLICY_MUTATION',severity:'reject',category:'signer_policy',categoryBit:1n<<7n,patterns:[/(?:modify|change|replace|disable|rotate|set|overwrite)\s+(?:the\s+)?(?:signer|attestor|policy|guardrails|moderator|signing\s+key)/i]},
+  {ruleId:'SETTLEMENT_MANIPULATION',severity:'reject',category:'settlement',categoryBit:1n<<8n,patterns:[/(?:fake|forge|bypass|manipulate|force|override)\s+(?:the\s+)?(?:settlement|completion|approval|verdict|validation)/i]},
+  {ruleId:'FUND_MOVEMENT',severity:'reject',category:'fund_movement',categoryBit:1n<<9n,patterns:[/(?:transfer|send|withdraw|drain|move)\s+(?:all\s+|the\s+)?(?:funds|sol|lamports|tokens|money|balance)/i, /(?:solana|spl-token)\s+transfer/i]},
+  {ruleId:'HIDDEN_CONTENT',severity:'reject',category:'hidden_content',categoryBit:1n<<10n,patterns:[/display\s*:\s*none|visibility\s*:\s*hidden|<!--|<script/i]},
+  {ruleId:'ENCODED_BLOB',severity:'reject',category:'encoded_blob',categoryBit:1n<<11n,patterns:[/\b(?:base64|hex)\s*[:=(]/i, /(?:%[0-9a-f]{2}){4,}/i, /\b(?:[0-9a-f]{2}){16,}\b/i, /\b(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])[A-Za-z0-9+/]{24,}={0,2}\b/]},
 ];
 
-/**
- * Scanner descriptor for THIS service. Versioned distinctly from the storefront
- * (`agenc-moderation-api:scanner:policy-rules:<v>:v1`) and the agenc.ag
- * first-party signer (`agenc-ag-moderation:...:listing-task:v1`) so a verifier
- * can tell which scanner produced an attestation from `scanner_hash` alone.
- */
-const TASK_SAFETY_POLICY_VERSION = "task-safety-policy-v1";
-export const SCANNER_DESCRIPTOR = `agenc-moderation-api:scanner:policy-rules:${TASK_SAFETY_POLICY_VERSION}:public-service:v1`;
-
-/** sha256 of the stable scanner descriptor — the on-chain `scanner_hash` (32 bytes). */
-export function scannerHashBytes(): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(SCANNER_DESCRIPTOR).digest());
+// Every byte of the executable regex bundle and preprocessing version is committed.
+export const SCANNER_DESCRIPTOR = 'agenc-desktop:scanner:v1';
+const NORMALIZATION_VERSION = 'nfkc-controls-keys-values-decode-v1';
+export function scannerBundle(): string {
+  return JSON.stringify({ normalization: NORMALIZATION_VERSION, maxDepth:32, maxTextInputs:512, distinctTextInputs:true, quotedBaseCommit:true, camelCaseIdentifiersNotBlobs:true, sandboxDeniedEnvNames:true, decodeRounds:3, decodeSurfaces:32, repoHexMetadata:["baseCommit","treeSha","allowedPathsHash","testCommandHash"], githubBaseCommitMetadata:true, workerImageDigest: process.env.WORKER_IMAGE_DIGEST ?? null,
+    rules: POLICY_RULES.map(r => ({id:r.ruleId,severity:r.severity,category:r.category,bit:r.categoryBit.toString(),patterns:r.patterns.map(p=>({source:p.source,flags:p.flags}))})) });
 }
-
-export function scannerHashHex(): string {
-  return Buffer.from(scannerHashBytes()).toString("hex");
+export function scannerHashBytes(): Uint8Array { return createHash('sha256').update(scannerBundle()).digest(); }
+export function scannerHashHex(): string { return Buffer.from(scannerHashBytes()).toString('hex'); }
+// Distinct strings only: a kit job spec repeats the same keys and values in every
+// execution criterion, and scanning one string twice gives the same answer.
+const MAX_TEXT_INPUTS = 512;
+const BLOCKED_ENV_PATH = /^spec\.execution\.sandbox\.environment\.blockedEnvPrefixes\[\d+\]$/;
+const IDENTIFIER = /\b(?:[a-z]+|[A-Z][a-z]+)(?:[A-Z][a-z]+)+\b/g;
+function declaredBaseCommits(payload: Record<string, unknown>): string[] {
+  const pick = (value: unknown) => {
+    const commit = value && typeof value === 'object' ? (value as {baseCommit?: unknown}).baseCommit : undefined;
+    return typeof commit === 'string' && /^[0-9a-f]{40}$/.test(commit) ? [commit] : [];
+  };
+  const custom = payload.custom && typeof payload.custom === 'object' ? (payload.custom as {github?: unknown}).github : undefined;
+  return [...new Set([...pick(custom), ...pick(payload.repo)])];
 }
-
-const MAX_TEXT_INPUTS = 256;
+const HEX_METADATA_PATH = /^spec\.(?:repo\.(?:baseCommit|treeSha|allowedPathsHash|testCommandHash)|custom\.github\.baseCommit)$/;
 const TRUNCATED_INPUT_CATEGORY_BIT = 1n << 5n;
-
-/**
- * Structured execution-plan fields excluded from prose scanning. These fields
- * legitimately name secret/env/shell patterns in deny lists or transport
- * config. Unexpected `execution.*` fields are still scanned.
- */
-const KIT_SPEC_UNSCANNED_EXECUTION_KEYS = new Set([
-  "adapter",
-  "allowedDomains",
-  "allowedHostnames",
-  "allowedHosts",
-  "allowedTools",
-  "args",
-  "blockedCommands",
-  "blockedEnvPrefixes",
-  "blockedHosts",
-  "command",
-  "container",
-  "deniedTools",
-  "env",
-  "environment",
-  "forbiddenCommands",
-  "forbiddenToolGroups",
-  "image",
-  "network",
-  "permissions",
-  "resourceLimits",
-  "runtime",
-  "sandbox",
-  "timeout",
-  "timeoutMs",
-  "toolAllowlist",
-  "toolDenylist",
-  "transport",
-]);
+const CONTROLS = /[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
+function normalized(s: string): string { return s.normalize('NFKC').replace(CONTROLS,''); }
+function surfaces(s: string): string[] {
+  const out = [normalized(s)];
+  // Bounded decoding; any encoded blob also independently blocks below.
+  for(let round=0; round<3; round++) {
+    for(const text of [...out]) {
+      try { const decoded = normalized(decodeURIComponent(text)); if(!out.includes(decoded)) out.push(decoded); } catch { /* malformed */ }
+      for(const token of text.match(/[A-Za-z0-9+/]{16,}={0,2}|(?:[0-9a-fA-F]{2}){8,}/g) ?? []) {
+        for(const encoding of ['base64','hex'] as const) {
+          const decoded = normalized(Buffer.from(token,encoding).toString('utf8'));
+          if(decoded && !out.includes(decoded)) out.push(decoded);
+        }
+      }
+      if(out.length > 32) return out.slice(0,32);
+    }
+  }
+  return out;
+}
 
 interface SpecTextInput {
   source: string;
@@ -179,62 +161,41 @@ interface SpecTextInput {
 interface SpecTextCollection {
   inputs: SpecTextInput[];
   truncated: boolean;
+  categories?: string[];
+  reasons?: string[];
 }
 
-function collectStringsRecursively(value: unknown, path: string, out: SpecTextInput[]): boolean {
+function collectStringsRecursively(value: unknown, path: string, out: SpecTextInput[], depth = 0, seen = new Set<string>()): boolean {
+  if(depth > 32) return true;
   if (typeof value === "string") {
-    if (!value.trim()) return false;
+    // Hex metadata fields are exempt from the encoded-blob rule only at their own path, so the
+    // same string anywhere else must still be scanned on its own.
+    const metadata = HEX_METADATA_PATH.test(path);
+    if (!value.trim() || (!metadata && seen.has(value))) return false;
     if (out.length >= MAX_TEXT_INPUTS) return true;
+    if (!metadata) seen.add(value);
     out.push({ source: path, value });
     return false;
   }
   if (Array.isArray(value)) {
     for (const [index, item] of value.entries()) {
-      if (collectStringsRecursively(item, `${path}[${index}]`, out)) return true;
+      if (collectStringsRecursively(item, `${path}[${index}]`, out, depth+1, seen)) return true;
     }
     return false;
   }
   if (value && typeof value === "object") {
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (collectStringsRecursively(item, `${path}.${key}`, out)) return true;
+      if (collectStringsRecursively(key, `${path}.${key}#key`, out, depth+1, seen)) return true;
+      if (collectStringsRecursively(item, `${path}.${key}`, out, depth+1, seen)) return true;
     }
   }
   return false;
 }
 
-/**
- * The text surface the scanner sees: every string value in the PAYLOAD
- * recursively, except known execution-plan config fields on kit-shaped
- * payloads. Non-kit payloads are scanned over all string values recursively.
- */
+/** All payload keys and string values, including execution configuration. */
 function collectSpecTextInputReport(payload: Record<string, unknown>): SpecTextCollection {
   const out: SpecTextInput[] = [];
-  const kitShaped =
-    payload.kind === "agenc.marketplace.jobSpec" ||
-    typeof payload.title === "string" ||
-    typeof payload.shortDescription === "string";
-  if (!kitShaped) {
-    return { inputs: out, truncated: collectStringsRecursively(payload, "spec", out) };
-  }
-  let truncated = false;
-  for (const [key, value] of Object.entries(payload)) {
-    if (key === "execution" && value && typeof value === "object" && !Array.isArray(value)) {
-      for (const [executionKey, executionValue] of Object.entries(value as Record<string, unknown>)) {
-        if (KIT_SPEC_UNSCANNED_EXECUTION_KEYS.has(executionKey)) continue;
-        truncated ||= collectStringsRecursively(
-          executionValue,
-          `spec.execution.${executionKey}`,
-          out,
-        );
-        if (truncated) break;
-      }
-      if (truncated) break;
-      continue;
-    }
-    truncated ||= collectStringsRecursively(value, `spec.${key}`, out);
-    if (truncated) break;
-  }
-  return { inputs: out, truncated };
+  return {inputs:out,truncated:collectStringsRecursively(payload,'spec',out)};
 }
 
 export function collectSpecTextInputs(payload: Record<string, unknown>): SpecTextInput[] {
@@ -251,6 +212,8 @@ export interface ScanResult {
   categoryMask: bigint;
   /** True when the scanner refused to attest because the text surface exceeded its cap. */
   truncated: boolean;
+  categories?: string[];
+  reasons?: string[];
 }
 
 /**
@@ -267,15 +230,29 @@ export function scanPayload(payload: Record<string, unknown>): ScanResult {
       status: MODERATION_STATUS.BLOCKED,
       riskScore: HEURISTIC_RISK_SCORE.blocked,
       categoryMask: TRUNCATED_INPUT_CATEGORY_BIT,
+      reasons: ['INPUT_LIMIT'],
       truncated: true,
     };
   }
   let hasReject = false;
   let hasWarning = false;
   let categoryMask = 0n;
+  const categories = new Set<string>(); const reasons = new Set<string>();
+  const commits = declaredBaseCommits(payload);
   for (const input of inputs) {
+    const metadataHash = (/^spec\.repo\.(baseCommit|treeSha|allowedPathsHash|testCommandHash)$/.test(input.source) && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.value)) ||
+      (input.source === 'spec.custom.github.baseCommit' && /^[0-9a-f]{40}$/.test(input.value));
+    // An env var name in the sandbox deny-list names what the worker must never see.
+    const deniedEnvName = BLOCKED_ENV_PATH.test(input.source) && /^[A-Z][A-Z0-9_]{1,63}$/.test(input.value);
+    // The declared base commit may be quoted in prose; any other hex run is still a blob.
+    const text = commits.reduce((current, commit) => current.split(commit).join('base-commit'), input.value);
     for (const rule of POLICY_RULES) {
-      if (!rule.patterns.some((pattern) => pattern.test(input.value))) continue;
+      if(metadataHash && rule.ruleId === 'ENCODED_BLOB') continue;
+      if(deniedEnvName && rule.ruleId === 'PROMPT_OR_SECRET_EXFILTRATION') continue;
+      // camelCase schema identifiers are not base64; their decoded surfaces still face every other rule.
+      const subject = rule.ruleId === 'ENCODED_BLOB' ? text.replace(IDENTIFIER, ' ') : text;
+      if (!surfaces(subject).some(value => rule.patterns.some(pattern => pattern.test(value)))) continue;
+      categories.add(rule.category); reasons.add(rule.ruleId);
       categoryMask |= rule.categoryBit;
       if (rule.severity === "reject") hasReject = true;
       else if (rule.severity === "warning") hasWarning = true;
@@ -294,5 +271,6 @@ export function scanPayload(payload: Record<string, unknown>): ScanResult {
     riskScore: HEURISTIC_RISK_SCORE[verdict],
     categoryMask,
     truncated: false,
+    categories: [...categories].sort(), reasons: [...reasons].sort(),
   };
 }

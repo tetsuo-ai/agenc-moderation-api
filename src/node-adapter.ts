@@ -29,11 +29,11 @@ function byteCap(maxBytes: number): Transform {
   });
 }
 
+const socketIps = new WeakMap<Request,string>();
+export function socketIp(request: Request): string | undefined { return socketIps.get(request); }
 export function nodeRequestToWeb(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Request {
-  const host = req.headers.host ?? "localhost";
-  const proto =
-    (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0]?.trim() ?? "http";
-  const url = `${proto}://${host}${req.url ?? "/"}`;
+  // Routing needs a pathname, never a caller-controlled origin or proxy protocol.
+  const url = new URL(req.url ?? '/', 'http://localhost').toString();
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (typeof value === "string") headers.set(key, value);
@@ -46,7 +46,9 @@ export function nodeRequestToWeb(req: IncomingMessage, maxBytes = MAX_BODY_BYTES
     init.body = Readable.toWeb(capped) as unknown as BodyInit;
     init.duplex = "half";
   }
-  return new Request(url, init);
+  const request = new Request(url, init);
+  socketIps.set(request,req.socket.remoteAddress ?? "unknown");
+  return request;
 }
 
 export async function writeWebResponse(

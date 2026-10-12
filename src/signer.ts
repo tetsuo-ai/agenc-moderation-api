@@ -1,72 +1,46 @@
-/**
- * Attestation core: fail-closed moderation signer.
- *
- * Ported from the agenc.ag first-party signer
- * (`agenc-ag/apps/web/lib/server/moderation-signer.ts`) and generalized for a
- * standalone public service:
- *
- *  - the on-chain spec hash (ServiceListing.spec_hash / TaskJobSpec
- *    .job_spec_hash / the caller-declared pre-pin hash) is re-derived from the
- *    actual payload and MUST equal it, else we reject WITHOUT signing (a hash
- *    mismatch means the moderation PDA seed would not match what the
- *    publish/hire gate checks);
- *  - remote specs are fetched only through the SSRF-guarded pinned-address
- *    fetcher (`ssrf-fetch.ts`);
- *  - only CLEAN (status 0) is ever recorded; blocked/suspicious verdicts are
- *    HELD (returned without a signature);
- *  - EVERY ATTESTATION IMPLIES RETRIEVABLE CONTENT: before signing, a
- *    retrievable copy of the exact spec is verified (registry GET → caller's
- *    https URI → service-side registry pin) or the request is refused with
- *    SPEC_NOT_RETRIEVABLE (`retrievability.ts`);
- *  - signing is kit-native (`@solana/kit` + the marketplace SDK facade);
- *  - the signer may be the global `moderation_authority` OR a registered
- *    roster `ModerationAttestor` — when the loaded key differs from the
- *    on-chain global authority the roster PDA is attached automatically; a
- *    roster entry with a PENDING EXIT is rejected before signing (the P1.2
- *    program rejects its records from the moment of `request_attestor_exit`);
- *  - records are written to the P1.2 v2 moderator-keyed seeds
- *    (`[..., task/listing, job_spec_hash, moderator]`) — consumers present
- *    THIS service's moderator pubkey at the consumption gates.
- *
- * THIS SERVICE SIGNS AND PAYS REAL TRANSACTIONS on whatever cluster RPC_URL
- * points at. The router's per-IP + global rate limits are the economic bound.
- */
+import { scannerHash as repositoryScannerHash } from '../worker/rules.js';
+import { validateJob, type GithubSpec } from '../worker/types.js';
+import type { GithubClient } from '../worker/github.js';
+import { buildPaymentOffer, readPaymentPrice, type PaymentOffer } from './payment.js';
+import { assertJsonDepth } from './json-depth.js';
+/** Creator-bound revision 5 task intake. All network boundaries are mockable in tests. */
 
-import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { bindRequester, type CreatorAuthorization } from "./binding.js";
+import { getStore, DEFAULT_SPEND_LIMITS, retryAfterSeconds, type AttestationStore, type SpendLimits } from "./store.js";
+import { authorizedVerdictKey, signDocument, type SignedDocument } from "./verdict.js";
+import { createHash, randomBytes } from "node:crypto";
 import {
   address,
-  appendTransactionMessageInstructions,
   createKeyPairSignerFromBytes,
   createSolanaRpc,
-  createTransactionMessage,
-  getBase64EncodedWireTransaction,
-  pipe,
-  setTransactionMessageFeePayerSigner,
-  setTransactionMessageLifetimeUsingBlockhash,
-  signTransactionMessageWithSigners,
+  fetchEncodedAccount,
   signature as solanaSignature,
   type Address,
   type Instruction,
   type TransactionSigner,
 } from "@solana/kit";
 import {
+  getRecordTaskModerationInstructionDataDecoder,
+  getRecordTaskModerationDiscriminatorBytes,
+  type TaskModeration,
   facade,
-  fetchMaybeHireRecord,
-  fetchMaybeServiceListing,
+  AGENC_COORDINATION_PROGRAM_ADDRESS,
+  fetchMaybeTaskModeration,
+  findTaskModerationPda,
   fetchMaybeTask,
   fetchMaybeTaskJobSpec,
   fetchMaybeModerationConfig,
   fetchMaybeModerationAttestor,
-  findHireRecordPda,
   findTaskJobSpecPda,
   findModerationConfigPda,
   findModerationAttestorPda,
   values,
 } from "@tetsuo-ai/marketplace-sdk";
-import { base58Decode, base58Encode } from "./base58.js";
+import { base58Decode } from "./base58.js";
 import { fetchJobSpecBody, JobSpecCheckError } from "./ssrf-fetch.js";
 import { moderationPolicyHashBytes, moderationPolicyHashHex } from "./policy.js";
-import { MODERATION_STATUS, scanPayload, scannerHashBytes, type Verdict } from "./scan.js";
+import { scanPayload, scannerHashBytes, scannerHashHex, type ScanResult, type Verdict } from "./scan.js";
 import {
   ModerationRejectError,
   ModerationSignerUnavailableError,
@@ -131,13 +105,14 @@ function decodeSecretKeyBytes(raw: string): Uint8Array {
 }
 
 /**
- * Load the moderation signer from `MODERATION_SIGNER_SECRET` (compatibility
- * fallback: `MODERATION_AUTHORITY_SECRET`, the agenc.ag env name). Throws
+ * Load R from MODERATION_SIGNER_SECRET_FILE (systemd credentials). Development
+ * alone permits legacy environment secrets. Throws
  * {@link ModerationSignerUnavailableError} (→ 503) when unset/invalid. NEVER
  * logs the key.
  */
 export async function loadModeratorSigner(): Promise<TransactionSigner> {
-  const raw =
+  if (process.env.NODE_ENV === 'production' && (process.env.MODERATION_SIGNER_SECRET || process.env.MODERATION_AUTHORITY_SECRET)) throw new ModerationSignerUnavailableError('Environment secrets forbidden in production.');
+  const raw = process.env.MODERATION_SIGNER_SECRET_FILE ? readFileSync(process.env.MODERATION_SIGNER_SECRET_FILE,'utf8') :
     process.env.MODERATION_SIGNER_SECRET ?? process.env.MODERATION_AUTHORITY_SECRET;
   if (!raw || !raw.trim()) {
     throw new ModerationSignerUnavailableError(
@@ -161,7 +136,8 @@ export async function loadModeratorSigner(): Promise<TransactionSigner> {
  * must fail loudly, not silently degrade).
  */
 export async function tryLoadModeratorSigner(): Promise<TransactionSigner | null> {
-  const raw =
+  if (process.env.NODE_ENV === 'production' && (process.env.MODERATION_SIGNER_SECRET || process.env.MODERATION_AUTHORITY_SECRET)) throw new ModerationSignerUnavailableError('Environment secrets forbidden in production.');
+  const raw = process.env.MODERATION_SIGNER_SECRET_FILE ? readFileSync(process.env.MODERATION_SIGNER_SECRET_FILE,'utf8') :
     process.env.MODERATION_SIGNER_SECRET ?? process.env.MODERATION_AUTHORITY_SECRET;
   if (!raw || !raw.trim()) return null;
   return loadModeratorSigner();
@@ -266,6 +242,7 @@ function parseSpecDocument(text: string): Record<string, unknown> {
   if (!document || typeof document !== "object" || Array.isArray(document)) {
     throw new ModerationRejectError(422, "Hosted spec must be a JSON object.");
   }
+  assertJsonDepth(document);
   return document as Record<string, unknown>;
 }
 
@@ -292,6 +269,7 @@ export async function resolveSpecAgainstHash(params: {
 }): Promise<ResolvedSpec> {
   const target = params.targetHashHex.toLowerCase();
   if (params.spec) {
+    assertJsonDepth(params.spec);
     const payload = unwrapPayload(params.spec);
     let canonical: { hex: string; bytes: Uint8Array } | null = null;
     try {
@@ -360,7 +338,7 @@ export async function resolveSpecAgainstHash(params: {
 /* ============================== attest core ============================== */
 
 /** The response shape (SDK `ListingModerationResult` / `TaskModerationResult`). */
-export interface ModerationResult {
+export interface ModerationResult extends Partial<Omit<PaymentOffer,'moderator'>> {
   verdict: Verdict;
   riskScore: number;
   /** Canonical spec hash (hex) — equals the on-chain spec_hash. */
@@ -370,84 +348,25 @@ export interface ModerationResult {
    * P1.2 `moderator` argument. Null in verdict-only mode (no signer).
    */
   moderator: string | null;
-  /** Present only on a CLEAN verdict that was signed + sent; null when held. */
+  /** Present only on a CLEAN verdict with a confirmed on-chain record; null when held. */
   attestation: { signature: string; recordedAt: string; expiresAt: string | null } | null;
   /** sha256 of the moderation policy document (hex) the attestation commits to. */
   policyHash: string;
   /**
-   * Present only on attested results: a retrievable copy of the exact spec
-   * content was verified (or pinned) BEFORE the attestation was recorded.
+   * Present on payment offers and attested results: a retrievable copy of the exact spec
+   * content was verified (or pinned) before the offer was signed.
    */
   retrievable?: true;
-  /** Present only on attested results: this service published the spec itself. */
+  /** Present on payment offers and attested results: this service published the spec itself. */
   pinned?: boolean;
-  /** Present only on attested results: https URL where the spec is retrievable. */
+  /** Present on payment offers and attested results: https URL where the spec is retrievable. */
   specRegistryUri?: string;
-}
-
-function firstTransactionSignatureBase58(signed: {
-  signatures: Readonly<Record<string, Uint8Array | null>>;
-}): string {
-  const sig = Object.values(signed.signatures).find(
-    (value): value is Uint8Array => value instanceof Uint8Array,
-  );
-  if (!sig) throw new Error("Moderation attestation transaction was not signed.");
-  return base58Encode(sig);
-}
-
-/**
- * Build + sign + send one moderation attestation transaction. The moderator is
- * the fee payer + the only signer. Returns the confirmed signature.
- */
-async function signAndSend(
-  rpcUrl: string,
-  instruction: Instruction,
-  moderator: TransactionSigner,
-): Promise<string> {
-  const rpc = createSolanaRpc(rpcUrl);
-  const { value: latestBlockhash } = await rpc
-    .getLatestBlockhash({ commitment: "confirmed" })
-    .send();
-  const message = pipe(
-    createTransactionMessage({ version: 0 }),
-    (m) => setTransactionMessageFeePayerSigner(moderator, m),
-    (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
-    (m) => appendTransactionMessageInstructions([instruction], m),
-  );
-  const signed = await signTransactionMessageWithSigners(message);
-  const sig = firstTransactionSignatureBase58(signed);
-  const rpcSignature = solanaSignature(sig);
-  const wire = getBase64EncodedWireTransaction(signed);
-  await rpc
-    .sendTransaction(wire, { encoding: "base64", preflightCommitment: "confirmed" })
-    .send();
-
-  const deadline = Date.now() + 90_000;
-  for (;;) {
-    const { value } = await rpc.getSignatureStatuses([rpcSignature]).send();
-    const status = value[0];
-    if (status) {
-      if (status.err != null) {
-        throw new Error(`Moderation attestation failed on-chain (signature ${sig}).`);
-      }
-      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") {
-        return sig;
-      }
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(
-        `Moderation attestation confirmation timed out (signature ${sig}). It may still land.`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-  }
-}
-
-/** Compute the on-chain `expires_at` (unix secs) for the configured TTL. */
-function expiresAt(ttlSeconds: number): { onChain: bigint; iso: string | null } {
-  if (!ttlSeconds || ttlSeconds <= 0) return { onChain: 0n, iso: null };
-  const at = Math.floor(Date.now() / 1000) + ttlSeconds;
-  return { onChain: BigInt(at), iso: new Date(at * 1000).toISOString() };
+  pending?: boolean;
+  jobId?: string;
+  retryAfterSeconds?: number;
+  preflightOnly?: boolean;
+  wouldAttest?: boolean;
+  signedVerdict?: SignedDocument;
 }
 
 export interface AttestDeps {
@@ -455,91 +374,19 @@ export interface AttestDeps {
   attestationTtlSeconds: number;
   /** Job-spec registry base for the retrievability gate (default: official). */
   jobSpecRegistryUrl?: string;
-  /** Operator registry write token; wallet upload tickets are used when null. */
+  /** Operator registry write token; required for enabled pins. */
   jobSpecRegistryToken?: string | null;
+  pinEnabled?: boolean;
+  cluster?: string;
+  store?: AttestationStore;
+  spendLimits?: SpendLimits;
+  attestationServiceFeeLamports?: number;
+  repository?: { workers: Readonly<Record<string,string>>; imageDigest: string; github?: GithubClient };
 }
 
-/**
- * Moderate + (when CLEAN) attest a LISTING. Reads the on-chain ServiceListing
- * for its spec_hash (+ spec_uri fallback), resolves the payload (inline > URI
- * param > on-chain spec_uri), fail-closed hash-matches it, scans, and on a
- * clean verdict records `record_listing_moderation`. A blocked/suspicious
- * verdict is HELD (no signature).
- */
-export async function attestListing(
-  deps: AttestDeps,
-  params: { listing: string; spec?: Record<string, unknown>; specUri?: string },
-): Promise<ModerationResult> {
-  const moderator = await tryLoadModeratorSigner();
-  const rpc = createSolanaRpc(deps.rpcUrl);
-  const listingAddr = address(params.listing);
-
-  const maybe = await fetchMaybeServiceListing(rpc, listingAddr);
-  if (!maybe.exists) {
-    throw new ModerationRejectError(404, "This listing does not exist on-chain.");
-  }
-  const onChainSpecHashHex = toHex(maybe.data.specHash as Uint8Array);
-  const resolved = await resolveSpecAgainstHash({
-    targetHashHex: onChainSpecHashHex,
-    spec: params.spec,
-    specUri: params.specUri ?? (maybe.data.specUri as string),
-    what: "listing spec",
-  });
-  const scan = scanPayload(resolved.payload);
-
-  const policyHash = moderationPolicyHashHex();
-  if (scan.verdict !== "clean" || moderator === null) {
-    // Held verdict, or verdict-only mode (no signer configured — disclosed at /v1/info).
-    return {
-      verdict: scan.verdict,
-      riskScore: scan.riskScore,
-      specHash: resolved.specHashHex,
-      moderator: moderator?.address ?? null,
-      attestation: null,
-      policyHash,
-    };
-  }
-
-  const mode = await resolveSignerMode(rpc, moderator);
-
-  // Every attestation implies retrievable content — fail-closed before signing
-  // (after signer-mode validation, so a misconfigured deployment never spends
-  // registry writes).
-  const retrievability = await ensureSpecRetrievable({
-    registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
-    registryToken: deps.jobSpecRegistryToken ?? null,
-    targetHashHex: resolved.specHashHex,
-    payload: resolved.payload,
-    candidateUris: [params.specUri, maybe.data.specUri as string],
-    resolvedFromUri: resolved.retrievedFromUri,
-    moderator,
-    what: "listing spec",
-  });
-
-  const ttl = expiresAt(deps.attestationTtlSeconds);
-  const instruction = (await facade.recordListingModeration({
-    listing: listingAddr,
-    moderator,
-    ...(mode.moderationAttestor ? { moderationAttestor: mode.moderationAttestor } : {}),
-    jobSpecHash: resolved.specHashBytes,
-    status: MODERATION_STATUS.CLEAN,
-    riskScore: scan.riskScore,
-    categoryMask: scan.categoryMask,
-    policyHash: moderationPolicyHashBytes(),
-    scannerHash: scannerHashBytes(),
-    expiresAt: ttl.onChain,
-  })) as Instruction;
-
-  const signature = await signAndSend(deps.rpcUrl, instruction, moderator);
-  return {
-    verdict: scan.verdict,
-    riskScore: scan.riskScore,
-    specHash: resolved.specHashHex,
-    moderator: moderator.address,
-    attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
-    policyHash,
-    ...attestedRetrievabilityFields(retrievability),
-  };
+/** Removed desktop listing-write surface. */
+export async function attestListing(_deps: AttestDeps, _params: {listing: string; spec?: Record<string,unknown>; specUri?: string}): Promise<ModerationResult> {
+  throw new ModerationRejectError(410,'Desktop attestor supports task intake only.');
 }
 
 /** Spread helper: the retrievability fields carried on attested results. */
@@ -553,187 +400,249 @@ function attestedRetrievabilityFields(
   };
 }
 
-/**
- * Moderate + (when CLEAN) attest a TASK.
- *
- * PRE-PIN mode (`jobSpecHash` + inline `spec` or `specUri` provided): the
- * caller declares the hash they will pin via `set_task_job_spec`; the payload
- * must hash to it. For listing hires on revision 5+, that hash must also equal
- * the immutable task commitment funded by `hire_from_listing`. This is the
- * flow external marketplaces need — the
- * TaskModeration PDA (P1.2 v2: seeded by task + job_spec_hash + moderator)
- * must exist before the pin's moderation gate will pass, and the pin
- * transaction must present this service's moderator pubkey.
- *
- * POST-PIN mode (neither provided): reads the pinned TaskJobSpec PDA
- * (job_spec_hash + job_spec_uri) like the first-party signer.
- */
-export async function attestTask(
-  deps: AttestDeps,
-  params: {
-    task: string;
-    jobSpecHash?: string;
-    spec?: Record<string, unknown>;
-    specUri?: string;
-    /** Raw submitted text for the legacy content-addressed binding (compat endpoint). */
-    rawText?: string;
-  },
-): Promise<ModerationResult> {
+/** Validate binding, scan, journal, then offer a creator-paid transaction and sign a separate verdict. */
+export async function attestTask(deps: AttestDeps, params: {
+  task: string; jobSpecHash?: string; spec?: Record<string,unknown>; specUri?: string; rawText?: string;
+  creatorAuthorization?: CreatorAuthorization; preflightOnly?: boolean;
+}): Promise<ModerationResult> {
+  if(params.spec) assertJsonDepth(params.spec);
   const moderator = await tryLoadModeratorSigner();
   const rpc = createSolanaRpc(deps.rpcUrl);
   const taskAddr = address(params.task);
-  let taskAccount: Awaited<ReturnType<typeof fetchMaybeTask>> | null = null;
-
-  // Verdict-only mode records nothing, so the on-chain existence check adds
-  // no protection — skip the read for self-contained (pre-pin) requests.
-  if (moderator !== null || !(params.spec || params.specUri)) {
-    taskAccount = await fetchMaybeTask(rpc, taskAddr);
-    if (!taskAccount.exists) {
-      throw new ModerationRejectError(404, "This task does not exist on-chain.");
+  const task = await fetchMaybeTask(rpc,taskAddr);
+  if(!task.exists) throw new ModerationRejectError(404,'Task does not exist.');
+  const [jobSpecPda] = await findTaskJobSpecPda({task:taskAddr});
+  const pinned = await fetchMaybeTaskJobSpec(rpc,jobSpecPda);
+  const target = params.jobSpecHash?.toLowerCase() ?? (params.spec ? (await values.canonicalJobSpecHash(unwrapPayload(params.spec))).hex : pinned.exists ? toHex(pinned.data.jobSpecHash as Uint8Array) : '');
+  if(!/^[0-9a-f]{64}$/.test(target)) throw new ModerationRejectError(400,'Invalid hash.');
+  if(pinned.exists && toHex(pinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Different hash already pinned.');
+  const store = deps.store ?? getStore();
+  const existing = store.get(params.task);
+  const queuedJob = store.intakeJob(params.task,target);
+  const queuedContext = queuedJob ? JSON.parse(queuedJob.context) as import('./store.js').QueueContext : existing && existing.expires>Date.now() ? store.binding(params.task,target) : undefined;
+  const priorAuthorization = queuedContext?.authenticatedCreator && queuedContext.creator === task.data.creator;
+  const admittedAuthorization = queuedContext?.creatorAuthorization && JSON.stringify(queuedContext.creatorAuthorization) === JSON.stringify(params.creatorAuthorization);
+  const authenticatedCreator = priorAuthorization && (!params.creatorAuthorization || admittedAuthorization)
+    ? (task.data.status === 0 && task.data.currentWorkers === 0 && task.data.completions === 0 ? true : (()=>{throw new ModerationRejectError(409,'Task changed.');})())
+    : bindRequester(task.data,params.task,target,params.creatorAuthorization,store,params.preflightOnly);
+  if(existing && (existing.expires > Date.now() || ['queued','reserved','pending'].includes(existing.state)) && existing.hash !== target) throw new ModerationRejectError(409,'One live hash per task.');
+  // The request that opened this intake fixed its spec URI: a later request cannot swap in its own.
+  // It is not refused for naming another either, because anyone may open the intake first (the
+  // description commitment binds the hash, not the URI). A spec the registry holds is signed with
+  // the registry's address for its hash, whatever URI anyone named (see ensureSpecRetrievable).
+  const specUri = queuedContext ? queuedContext.specUri : params.specUri;
+  if(!params.preflightOnly) store.rememberBinding(params.task,target,{payload:params.spec ?? {},creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization ?? queuedContext?.creatorAuthorization,specUri});
+  const resolved = await resolveSpecAgainstHash({targetHashHex:target,spec:params.spec,specUri:specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined),rawText:params.rawText,what:'task spec'});
+  let repo = resolved.payload.repo;
+  const custom = resolved.payload.custom as {github?:unknown} | undefined;
+  let reviewed: SignedDocument | undefined;
+  if (custom?.github !== undefined) {
+    if(params.preflightOnly) return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator?.address ?? null,attestation:null,policyHash:moderationPolicyHashHex(),preflightOnly:true,wouldAttest:false};
+    if((await values.canonicalJobSpecHash(resolved.payload)).hex !== target) throw new ModerationRejectError(422,'Repository intake requires the canonical job spec hash.');
+    if(!deps.repository || !Object.keys(deps.repository.workers).length || !moderator) throw new ModerationRejectError(503,'Repository worker and R required.');
+    if(queuedJob?.reviewed) {
+      reviewed = JSON.parse(queuedJob.reviewed) as SignedDocument;
+      if(reviewed.body.scannerHash !== repositoryScannerHash(deps.repository.imageDigest) || reviewed.body.policyHash !== moderationPolicyHashHex() || Date.parse(String(reviewed.body.expiresAt)) <= Date.now()) throw new ModerationRejectError(409,'Repository review changed or expired.');
+      repo = reviewed.body.repo;
+      if(reviewed.body.verdict === 'clean' && !repo) throw new ModerationRejectError(409,'Missing repository binding.');
+    } else {
+      let job;
+      try { job = validateJob({kind:'repo-intake',taskPda:params.task,jobSpecHash:target,github:custom.github as GithubSpec}); }
+      catch { throw new ModerationRejectError(422,'Invalid repository spec.'); }
+      if(!queuedJob) {
+        authorizedVerdictKey(moderator.address);
+        await resolveSignerMode(rpc,moderator);
+        if(task.data.creator === moderator.address) throw new ModerationRejectError(409,'Moderator must not be the fee payer.');
+        store.enqueueIntake(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS,job,{payload:resolved.payload,creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization,specUri:specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined)});
+      }
+      const pendingIntake=store.intakeJob(params.task,target)!;
+      return {verdict:'suspicious',riskScore:60,specHash:target,moderator:moderator.address,attestation:null,policyHash:moderationPolicyHashHex(),pending:true,jobId:pendingIntake.id,retryAfterSeconds:retryAfterSeconds(pendingIntake)};
     }
   }
-
-  let resolved: ResolvedSpec;
-  if (params.jobSpecHash || params.spec || params.specUri) {
-    // PRE-PIN: the target hash comes from the caller. When only a spec is
-    // given, its canonical hash IS the target (self-declared, still exact —
-    // the gate seeds from whatever the creator later pins, and the creator's
-    // client refuses to pin a hash without a matching attestation).
-    let target = params.jobSpecHash?.trim().toLowerCase() ?? "";
-    if (!target) {
-      if (!params.spec) {
-        throw new ModerationRejectError(
-          400,
-          "Pre-pin task moderation needs jobSpecHash (with spec or specUri), or an inline spec.",
-        );
-      }
-      try {
-        target = (await values.canonicalJobSpecHash(unwrapPayload(params.spec))).hex;
-      } catch {
-        throw new ModerationRejectError(
-          422,
-          "Inline task spec payload is not JSON-canonicalizable (json-stable-v1).",
-        );
-      }
-    }
-    if (!/^[0-9a-f]{64}$/.test(target)) {
-      throw new ModerationRejectError(400, "jobSpecHash must be 64 lowercase hex chars.");
-    }
-
-    // A revision-5 listing hire commits its task-specific job-spec hash before
-    // funds move. Do not spend registry bandwidth or record an unusable
-    // attestation for a caller-substituted hash. Direct tasks have no
-    // HireRecord and therefore continue to bind at set_task_job_spec time.
-    if (moderator !== null && taskAccount?.exists) {
-      const [hireRecordPda] = await findHireRecordPda({ task: taskAddr });
-      const hireRecord = await fetchMaybeHireRecord(rpc, hireRecordPda);
-      if (hireRecord.exists) {
-        if (String(hireRecord.data.task) !== String(taskAddr)) {
-          throw new ModerationRejectError(
-            422,
-            "The canonical HireRecord does not belong to this task; refusing to attest.",
-          );
-        }
-        const description = taskAccount.data.description as Uint8Array;
-        if (!(description instanceof Uint8Array) || description.length !== 64) {
-          throw new ModerationRejectError(
-            422,
-            "The hired task has a malformed on-chain commitment; refusing to attest.",
-          );
-        }
-        const fundedHash = description.subarray(32, 64);
-        const fundedHashHex = toHex(fundedHash);
-        if (fundedHashHex === "0".repeat(64)) {
-          throw new ModerationRejectError(
-            409,
-            "This legacy listing hire has no funded task job-spec commitment. Cancel and re-hire it with a revision-5 client before requesting attestation.",
-          );
-        }
-        if (fundedHashHex !== target) {
-          throw new ModerationRejectError(
-            422,
-            "jobSpecHash does not match the immutable task job-spec commitment funded by hire_from_listing.",
-          );
-        }
-      }
-    }
-    resolved = await resolveSpecAgainstHash({
-      targetHashHex: target,
-      spec: params.spec,
-      specUri: params.specUri,
-      rawText: params.rawText,
-      what: "task spec",
-    });
-  } else {
-    const [jobSpecPda] = await findTaskJobSpecPda({ task: taskAddr });
-    const jobSpec = await fetchMaybeTaskJobSpec(rpc, jobSpecPda);
-    if (!jobSpec.exists) {
-      throw new ModerationRejectError(
-        409,
-        "This task has no job spec pinned yet and no spec was provided — nothing to moderate. Provide jobSpecHash + spec/specUri (pre-pin) or pin the job spec first.",
-      );
-    }
-    resolved = await resolveSpecAgainstHash({
-      targetHashHex: toHex(jobSpec.data.jobSpecHash as Uint8Array),
-      specUri: jobSpec.data.jobSpecUri as string,
-      what: "task spec",
-    });
+  const repoFields = ['id','owner','name','licenseSpdx','baseCommit','treeSha','allowedPathsHash','maxDiffBytes','testCommandHash'];
+  if(repo === null && !reviewed) throw new ModerationRejectError(422,'Invalid repo metadata.');
+  if(repo != null) {
+    if(!repo || typeof repo !== 'object' || Array.isArray(repo)) throw new ModerationRejectError(422,'Invalid repo metadata.');
+    const r = repo as Record<string,unknown>;
+    if(repoFields.some(f=> f === 'maxDiffBytes' ? !Number.isSafeInteger(r[f]) || Number(r[f])<=0 : f === 'id' && reviewed ? !Number.isSafeInteger(r[f]) || Number(r[f])<=0 : typeof r[f] !== 'string' || !r[f])) throw new ModerationRejectError(422,'Incomplete repo metadata.');
+    if(!/^[0-9a-f]{40}$/.test(String(r.baseCommit)) || !/^[0-9a-f]{40}$/.test(String(r.treeSha)) || !/^[0-9a-f]{64}$/.test(String(r.allowedPathsHash)) || !/^[0-9a-f]{64}$/.test(String(r.testCommandHash))) throw new ModerationRejectError(422,'Invalid repo hashes.');
   }
-
-  const scan = scanPayload(resolved.payload);
-  const policyHash = moderationPolicyHashHex();
-  if (scan.verdict !== "clean" || moderator === null) {
-    // Held verdict, or verdict-only mode (no signer configured — disclosed at /v1/info).
-    return {
-      verdict: scan.verdict,
-      riskScore: scan.riskScore,
-      specHash: resolved.specHashHex,
-      moderator: moderator?.address ?? null,
-      attestation: null,
-      policyHash,
-    };
-  }
-
-  const mode = await resolveSignerMode(rpc, moderator);
-
-  // Every attestation implies retrievable content — fail-closed before
-  // signing. A CLEAN record for a spec nobody can fetch produces a task
-  // workers can claim but never read (the dead-spec incident shape). Runs
-  // after signer-mode validation so a misconfigured deployment never spends
-  // registry writes.
-  const retrievability = await ensureSpecRetrievable({
-    registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
-    registryToken: deps.jobSpecRegistryToken ?? null,
-    targetHashHex: resolved.specHashHex,
-    payload: resolved.payload,
-    candidateUris: [params.specUri],
-    resolvedFromUri: resolved.retrievedFromUri,
-    moderator,
-    what: "task spec",
-  });
-
-  const ttl = expiresAt(deps.attestationTtlSeconds);
-  const instruction = (await facade.recordTaskModeration({
-    task: taskAddr,
-    moderator,
-    ...(mode.moderationAttestor ? { moderationAttestor: mode.moderationAttestor } : {}),
-    jobSpecHash: resolved.specHashBytes,
-    status: MODERATION_STATUS.CLEAN,
-    riskScore: scan.riskScore,
-    categoryMask: scan.categoryMask,
-    policyHash: moderationPolicyHashBytes(),
-    scannerHash: scannerHashBytes(),
-    expiresAt: ttl.onChain,
-  })) as Instruction;
-
-  const signature = await signAndSend(deps.rpcUrl, instruction, moderator);
-  return {
-    verdict: scan.verdict,
-    riskScore: scan.riskScore,
-    specHash: resolved.specHashHex,
-    moderator: moderator.address,
-    attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
-    policyHash,
-    ...attestedRetrievabilityFields(retrievability),
+  const effectiveScannerHash = reviewed ? String(reviewed.body.scannerHash) : scannerHashHex();
+  const policyHash = moderationPolicyHashHex(), moderatorAddress = moderator?.address ?? null;
+  // The scan is CPU heavy on large specs. Run it once, and only when the stored verdict cannot answer.
+  let scanned: ScanResult | undefined;
+  const scanOnce = (): ScanResult => {
+    if(!scanned) {
+      scanned = scanPayload(resolved.payload);
+      if(reviewed) Object.assign(scanned,{verdict:reviewed.body.verdict,riskScore:reviewed.body.riskScore,categories:reviewed.body.categories,reasons:reviewed.body.reasons});
+    }
+    return scanned;
   };
+  if(params.preflightOnly) {
+    const scan = scanOnce();
+    return {verdict:scan.verdict,riskScore:scan.riskScore,specHash:target,moderator:moderatorAddress,attestation:null,policyHash,preflightOnly:true,wouldAttest:scan.verdict === 'clean' && moderator !== null};
+  }
+  const {key,keyId} = authorizedVerdictKey(moderatorAddress);
+  const genesisHash = await rpc.getGenesisHash().send();
+  if(reviewed && (reviewed.body.genesisHash !== genesisHash || reviewed.body.creator !== task.data.creator || reviewed.body.cluster !== (deps.cluster ?? 'mainnet'))) throw new ModerationRejectError(409,'Review context changed.');
+  const [pda] = moderator ? await findTaskModerationPda({task:taskAddr,jobSpecHash:resolved.specHashBytes,moderator:moderator.address}) : [null];
+  const readRecord = async () => pda ? await fetchModerationRecord(rpc,pda) : null;
+  // Field checks first, so a record that cannot match never costs a scan.
+  const usable = (record: Awaited<ReturnType<typeof readRecord>>) => record?.exists && record.data.status === 0 && record.data.creator === task.data.creator && record.data.task === taskAddr && record.data.moderator === moderator?.address && toHex(record.data.jobSpecHash as Uint8Array) === target && toHex(record.data.policyHash as Uint8Array) === policyHash && toHex(record.data.scannerHash as Uint8Array) === effectiveScannerHash && record.data.expiresAt > BigInt(Math.floor(Date.now()/1000)) && record.data.riskScore === scanOnce().riskScore && record.data.categoryMask === BigInt(scanOnce().categoryMask);
+  let record = await readRecord();
+  let cachedPayment: ModerationResult|undefined;
+  if(existing?.result && existing.hash === target && existing.expires > Date.now()) {
+    const cached = JSON.parse(existing.result) as ModerationResult;
+    const cachedBody = cached.signedVerdict?.body;
+    if(cachedBody?.policyHash !== policyHash || cachedBody.scannerHash !== effectiveScannerHash || cachedBody.genesisHash !== genesisHash || cachedBody.programId !== AGENC_COORDINATION_PROGRAM_ADDRESS || cachedBody.creator !== task.data.creator || cached.moderator !== moderatorAddress) throw new ModerationRejectError(409,'Policy or creator changed; operator review required.');
+    if(existing.state === 'held') return cached;
+    if(usable(record)) return confirmPayment(deps,params.task,target,cached);
+    if(record?.exists || existing.state === 'confirmed') throw new ModerationRejectError(409,'Confirmed record changed or disappeared.');
+    if(cached.transaction && cached.lastValidBlockHeight !== undefined) {
+      if(await rpc.getBlockHeight({commitment:'confirmed'}).send() <= BigInt(cached.lastValidBlockHeight)) return cached;
+      cachedPayment=cached;
+    }
+  }
+  // Never automatically replace legacy R-paid reservations after upgrade.
+  if(existing && ['reserved','pending'].includes(existing.state) && !usable(record)) throw new ModerationRejectError(409,'Legacy payment needs reconciliation.');
+  const scan = scanOnce();
+  const result: ModerationResult = {verdict:scan.verdict,riskScore:scan.riskScore,specHash:target,moderator:moderatorAddress,attestation:null,policyHash};
+  store.admit(params.task,target,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS);
+  let retrievability: SpecRetrievability | undefined;
+  let expires = cachedPayment ? existing!.expires : Math.min(Math.floor(Date.now()/1000)*1000+72*3600000,reviewed ? Date.parse(String(reviewed.body.expiresAt)):Infinity);
+  if(scan.verdict === 'clean' && moderator && pda) {
+    result.recordPda = pda;
+    if(usable(record) && record?.exists) {
+      expires = Math.min(Number(record.data.expiresAt)*1000,expires);
+      result.attestation = {signature:await recordSignature(deps.rpcUrl,pda,record.data),recordedAt:new Date(Number(record.data.recordedAt)*1000).toISOString(),expiresAt:new Date(expires).toISOString()};
+    } else {
+      if(record?.exists) throw new ModerationRejectError(409,'Existing on-chain record requires operator review.');
+      const mode = await resolveSignerMode(rpc,moderator);
+      retrievability = await ensureSpecRetrievable({registryUrl:deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,registryToken:deps.jobSpecRegistryToken ?? null,pinEnabled:deps.pinEnabled,authenticatedCreator,targetHashHex:target,payload:resolved.payload,candidateUris:[specUri],resolvedFromUri:resolved.retrievedFromUri,moderator:null,what:'task spec'});
+      const instruction = await facade.recordTaskModeration({task:taskAddr,moderator,...(mode.moderationAttestor ? {moderationAttestor:mode.moderationAttestor}:{}),jobSpecHash:resolved.specHashBytes,status:0,riskScore:scan.riskScore,categoryMask:scan.categoryMask,policyHash:moderationPolicyHashBytes(),scannerHash:Buffer.from(effectiveScannerHash,'hex'),expiresAt:BigInt(Math.floor(expires/1000))}) as Instruction;
+      // Close the read/build race as far as possible without changing revision 5.
+      const current = await fetchMaybeTask(rpc,taskAddr);
+      if(!current.exists || current.data.creator !== task.data.creator || current.data.status !== 0 || current.data.currentWorkers !== 0 || current.data.completions !== 0) throw new ModerationRejectError(409,'Task changed.');
+      if(!priorAuthorization) bindRequester(current.data,params.task,target,params.creatorAuthorization,store,true);
+      const latestPinned = await fetchMaybeTaskJobSpec(rpc,jobSpecPda);
+      if(latestPinned.exists && toHex(latestPinned.data.jobSpecHash as Uint8Array) !== target) throw new ModerationRejectError(409,'Pin changed.');
+      record = await readRecord();
+      if(record?.exists) throw new ModerationRejectError(409,'Record appeared; retry read.');
+      store.assertPaymentCapacity(params.task,task.data.creator,deps.spendLimits ?? DEFAULT_SPEND_LIMITS);
+      const price=cachedPayment ? {priceLamports:cachedPayment.priceLamports!,rentLamports:cachedPayment.rentLamports!,serviceFeeLamports:cachedPayment.serviceFeeLamports!} : await readPaymentPrice(deps.rpcUrl,deps.attestationServiceFeeLamports ?? 0);
+      Object.assign(result,await buildPaymentOffer(deps.rpcUrl,task.data.creator,moderator,pda,instruction,price));
+    }
+  }
+  if(retrievability) Object.assign(result,attestedRetrievabilityFields(retrievability));
+  const issuedAt = new Date().toISOString();
+  const body: Record<string,unknown> = {...(reviewed?.body ?? {}),v:1,kind:'task-intake',cluster:deps.cluster ?? 'mainnet',genesisHash,programId:AGENC_COORDINATION_PROGRAM_ADDRESS,taskPda:params.task,creator:task.data.creator,jobSpecHash:target,jobSpecUri:retrievability?.specRegistryUri ?? specUri ?? (pinned.exists ? pinned.data.jobSpecUri : null),policyHash:result.policyHash,scannerHash:effectiveScannerHash,verdict:scan.verdict,riskScore:scan.riskScore,categories:scan.categories ?? [],reasons:scan.reasons ?? (scan.truncated ? ['INPUT_LIMIT'] : []),payment:result.priceLamports !== undefined ? {recordPda:pda,priceLamports:result.priceLamports,payer:task.data.creator} : null,record:{moderator:result.moderator,pda:scan.verdict === 'clean' ? pda : null,txSignature:result.attestation?.signature || null},issuedAt,expiresAt:new Date(expires).toISOString(),nonce:randomBytes(16).toString('hex'),keyId};
+  if(repo && typeof repo === 'object' && !Array.isArray(repo)) {
+    const r = repo as Record<string,unknown>;
+    body.repo = Object.fromEntries(repoFields.map(f=>[f,r[f]]));
+  }
+  result.signedVerdict = cachedPayment?.signedVerdict ?? signDocument(body,key);
+  if(result.transaction) {
+    const offer=store.saveOffer(params.task,target,task.data.creator,result,expires,deps.spendLimits ?? DEFAULT_SPEND_LIMITS,existing?.result);
+    if(queuedJob && reviewed) store.finishJob(queuedJob.id,offer,expires);
+    return offer;
+  }
+  if(store.get(params.task)?.state === 'pending') store.finish(params.task,result,expires);
+  else store.saveVerdict(params.task,target,task.data.creator,result,expires);
+  if(queuedJob && reviewed) store.finishJob(queuedJob.id,result,expires);
+  return result;
+}
+
+const SYSTEM_PROGRAM_ADDRESS = '11111111111111111111111111111111';
+/** Anyone can send lamports to the record address before it exists. That account stays
+ * System-owned with no data, the program still creates the record over it, so it counts as
+ * absent. Any other account that does not decode is still an error. */
+async function fetchModerationRecord(rpc: ReturnType<typeof createSolanaRpc>, pda: Address) {
+  try { return await fetchMaybeTaskModeration(rpc,pda); }
+  catch (error) {
+    const raw = await fetchEncodedAccount(rpc,pda);
+    if(raw.exists && raw.programAddress === SYSTEM_PROGRAM_ADDRESS && raw.data.length === 0) return {exists:false as const,address:pda};
+    throw error;
+  }
+}
+
+/** Obtain an actual confirmed signature from PDA history; never invent a receipt. */
+async function recordSignature(rpcUrl: string, pda: string, record: TaskModeration): Promise<string> {
+  const rpc=createSolanaRpc(rpcUrl);
+  const history=await rpc.getSignaturesForAddress(address(pda),{commitment:'confirmed',limit:20}).send();
+  for(const receipt of history) {
+    if(receipt.err !== null) continue;
+    const tx=await rpc.getTransaction(solanaSignature(receipt.signature),{commitment:'confirmed',encoding:'json',maxSupportedTransactionVersion:0}).send();
+    if(!tx || !tx.meta || tx.meta.err !== null) continue;
+    const message=tx.transaction.message;
+    const keys=[...message.accountKeys,...(tx.meta.loadedAddresses?.writable ?? []),...(tx.meta.loadedAddresses?.readonly ?? [])];
+    for(const ix of message.instructions) {
+      if(keys[ix.programIdIndex] !== AGENC_COORDINATION_PROGRAM_ADDRESS || keys[ix.accounts[1]] !== record.task ||
+         keys[ix.accounts[2]] !== record.moderator || keys[ix.accounts[3]] !== pda) continue;
+      try {
+        const bytes=base58Decode(ix.data);
+        if(!Buffer.from(bytes.subarray(0,8)).equals(Buffer.from(getRecordTaskModerationDiscriminatorBytes()))) continue;
+        const data=getRecordTaskModerationInstructionDataDecoder().decode(bytes);
+        if(Buffer.from(data.jobSpecHash).equals(Buffer.from(record.jobSpecHash)) && data.status===record.status &&
+           data.riskScore===record.riskScore && data.categoryMask===record.categoryMask && data.expiresAt===record.expiresAt &&
+           Buffer.from(data.policyHash).equals(Buffer.from(record.policyHash)) && Buffer.from(data.scannerHash).equals(Buffer.from(record.scannerHash))) return receipt.signature;
+      } catch { /* Unrelated instruction: continue looking for the record receipt. */ }
+    }
+  }
+  throw new ModerationRejectError(502,'Confirmed record signature unavailable.');
+}
+async function confirmPayment(deps:AttestDeps,task:string,hash:string,result:ModerationResult):Promise<ModerationResult> {
+  if(result.attestation) return result;
+  const {key,keyId}=authorizedVerdictKey(result.moderator);
+  const body=result.signedVerdict!.body;
+  const record=await fetchModerationRecord(createSolanaRpc(deps.rpcUrl),address(result.recordPda!));
+  if(!record.exists || !recordMatches(record.data,result,task,hash)) throw new ModerationRejectError(409,'Record binding changed.');
+  const signature=await recordSignature(deps.rpcUrl,result.recordPda!,record.data);
+  const paid={...result};
+  delete paid.transaction;delete paid.lastValidBlockHeight;
+  paid.attestation={signature,recordedAt:new Date(Number(record.data.recordedAt)*1000).toISOString(),expiresAt:String(body.expiresAt)};
+  paid.signedVerdict=signDocument({...body,keyId,record:{...(body.record as Record<string,unknown>),txSignature:signature}},key);
+  const store=deps.store ?? getStore();
+  store.saveVerdict(task,hash,String(body.creator),paid,Date.parse(String(body.expiresAt)));
+  const job=store.intakeJob(task,hash);if(job) store.finishJob(job.id,paid,Date.parse(String(body.expiresAt)));
+  return paid;
+}
+/** How long GET reuses a chain answer for one stored attestation, so repeated reads do not each cost an RPC call. */
+export const ATTESTATION_READ_CACHE_MS = 5_000;
+const recentReads = new Map<string,{stored:string;until:number;answer:Promise<ModerationResult>}>();
+/** GET only reconciles a paid record; it never creates or reissues transactions. */
+export async function getStoredAttestation(deps:AttestDeps,task:string,hash:string):Promise<ModerationResult|undefined> {
+  const store=deps.store ?? getStore();
+  const saved=store.get(task);
+  if(!saved?.result || saved.hash!==hash || saved.expires<=Date.now()) return undefined;
+  const result=JSON.parse(saved.result) as ModerationResult;
+  if(result.verdict !== 'clean' || !result.recordPda) return result;
+  // Concurrent and repeated GETs of the same stored row share one chain read, errors included.
+  const key=task+':'+hash, now=Date.now(), recent=recentReads.get(key);
+  if(recent && recent.stored === saved.result && recent.until > now) return recent.answer;
+  if(recentReads.size >= 1_000) for(const [k,v] of recentReads) if(v.until <= now) recentReads.delete(k);
+  const entry={stored:saved.result,until:now+ATTESTATION_READ_CACHE_MS,answer:reconcileStored(deps,task,hash,result)};
+  recentReads.set(key,entry);
+  // Confirming a payment rewrites the row. The answer is that new row, so keep serving it.
+  entry.answer.then(answer=>{
+    try { const current=store.get(task)?.result; if(current === JSON.stringify(answer)) entry.stored=current; } catch { /* The entry then simply expires. */ }
+  },()=>{});
+  return entry.answer;
+}
+async function reconcileStored(deps:AttestDeps,task:string,hash:string,result:ModerationResult):Promise<ModerationResult> {
+  const record=await fetchModerationRecord(createSolanaRpc(deps.rpcUrl),address(result.recordPda!));
+  if(!record.exists) {
+    if(result.attestation) throw new ModerationRejectError(409,'Confirmed record disappeared.');
+    return result;
+  }
+  if(!recordMatches(record.data,result,task,hash))
+    throw new ModerationRejectError(409,'Confirmed record binding mismatch.');
+  return confirmPayment(deps,task,hash,result);
+}
+
+function recordMatches(record:TaskModeration,result:ModerationResult,task:string,hash:string):boolean {
+  const b=result.signedVerdict!.body;
+  return record.status===0 && record.task===task && record.creator===b.creator && record.moderator===result.moderator &&
+    Buffer.from(record.jobSpecHash).toString('hex')===hash && Buffer.from(record.policyHash).toString('hex')===b.policyHash &&
+    Buffer.from(record.scannerHash).toString('hex')===b.scannerHash && record.riskScore===result.riskScore &&
+    record.expiresAt>=BigInt(Math.floor(Date.parse(String(b.expiresAt))/1000)) && record.expiresAt>BigInt(Math.floor(Date.now()/1000));
 }

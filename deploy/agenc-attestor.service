@@ -1,0 +1,49 @@
+[Unit]
+Description=AgenC Desktop task intake signer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agenc-signer
+Group=agenc-signer
+WorkingDirectory=/opt/agenc-attestor
+ExecStart=/usr/bin/node /opt/agenc-attestor/dist/bin.js
+Environment=NODE_ENV=production HOST=127.0.0.1 PORT=8787 TRUST_PROXY=1
+Environment=ATTESTATION_DB_PATH=/var/lib/agenc-attestor/attestations.sqlite
+Environment=MODERATION_SIGNER_SECRET_FILE=%d/moderation.key VERDICT_KEY_FILE=%d/verdict.pem
+Environment=KEY_MANIFEST_FILE=/etc/agenc-attestor/keys.json
+EnvironmentFile=/etc/agenc-attestor/service.env
+LoadCredentialEncrypted=moderation.key:/etc/credstore.encrypted/agenc-moderation.key
+LoadCredentialEncrypted=verdict.pem:/etc/credstore.encrypted/agenc-verdict.pem
+StateDirectory=agenc-attestor
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+TasksMax=64
+MemoryMax=1G
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

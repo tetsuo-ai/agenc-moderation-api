@@ -1,281 +1,466 @@
-# AgenC Moderation API
+# AgenC Desktop attestor — queued repository intake and deliverable review
 
-Publicly callable + self-hostable **moderation attestation service** for the
-[AgenC marketplace protocol](https://github.com/tetsuo-ai/agenc-protocol)
-(Solana program `HJsZ53Zb27b8QMRbQpuDngE44AdwCGxvEZr61Zmxw1xK`).
+Revision 5 task intake with creator binding, a durable SQLite journal, creator
+quotas, and V-signed off-chain verdicts. AgenC is the only attestor. Its roster key
+R partially signs payment transactions; the task creator co-signs and submits
+them. The service never submits Solana transactions. Repository screening uses
+signed worker reports and independent signer checks. Deliverable reviews stay
+off-chain and require no payment. No program upgrade is required.
 
-The on-chain publish/hire gates require a moderation attestation
-(`TaskModeration` / `ListingModeration` PDA) before a task's job spec can be
-pinned or a listing hired. This service is the open implementation of the
-attestor that records them:
+## HTTP contract
 
-1. you POST a listing/task + its job-spec payload,
-2. the service **fail-closed verifies** the payload hashes to exactly the
-   spec hash the on-chain gate is seeded with,
-3. scans it with the published deterministic policy (`GET /v1/policy` — its
-   sha-256 is the `policy_hash` every attestation commits to), and
-4. on a `clean` verdict signs + sends the on-chain `record_*_moderation`
-   transaction and returns the signature. `suspicious`/`blocked` verdicts are
-   **held** — never signed.
+- `POST /v1/moderation/tasks`: `{task, jobSpecHash, spec?, specUri?, creatorAuthorization?, preflightOnly?}`.
+- `POST /api/task-moderation/attest`: accepts `{taskPda, jobSpecHash, jobSpec?, jobSpecCanonicalJson?, text?, jobSpecUri?, creatorAuthorization?, preflightOnly?}`.
+- `GET /v1/attestations/:task/:hash`: persisted, unexpired signed result.
+- `POST /v1/moderation/deliverables`: `{task, submissionPda, artifactSha256}`.
+- `GET /v1/deliverable-reviews/:task/:submission/:artifact`: stored deliverable verdict.
+- `GET /v1/keys`: offline-root signed key manifest.
+- `GET /v1/policy`, `/v1/info`, `/v1/health`, `/openapi.json`.
 
-No kit entitlement, no account, no SDK required — plain HTTPS + JSON. In
-normal integrations you never call this directly: the marketplace SDK, React
-hooks, and store templates call it automatically inside hire/activation
-("invisible by default"). Running your own attestor is a sovereignty option,
-not a prerequisite.
+Desktop posts `{task, jobSpecHash, specUri, spec}`. A canonical payload with
+`custom.github` checks creator binding, Open/unclaimed task, pinned hash, one live
+hash, quotas, outstanding capacity and roster/key availability, then atomically
+queues a `repo-intake` job. The first POST returns **202**:
 
-## Hosted endpoints
-
-```text
-POST https://attest.agenc.ag/v1/moderation/tasks
-POST https://attest.agenc.ag/v1/moderation/listings
-POST https://attest.agenc.ag/api/task-moderation/attest   (compatibility shape)
-GET  https://attest.agenc.ag/v1/policy
-GET  https://attest.agenc.ag/v1/info
-GET  https://attest.agenc.ag/openapi.json
+```json
+{"ok":true,"moderator":"<R>","attested":false,"pending":true,"jobId":"<uuid>","retryAfterSeconds":5,"attestation":null}
 ```
 
-Open + rate-limited (per-IP and a service-wide ceiling — every clean verdict
-signs and pays a real mainnet transaction).
-
-### Attest a task job spec (pre-pin — the external-marketplace flow)
-
-Before your creator pins the spec with `set_task_job_spec`, request the
-attestation for the exact hash you will pin:
-
-```bash
-curl -sX POST https://attest.agenc.ag/v1/moderation/tasks \
-  -H 'content-type: application/json' \
-  -d '{
-    "task": "<TASK_PDA>",
-    "jobSpecHash": "<64-hex canonical payload hash>",
-    "spec": { "kind": "agenc.marketplace.jobSpec", "title": "...", ... }
-  }'
-```
-
-Response (`clean`):
+Repeat POST after five seconds. GET returns **404** until the worker result has
+been independently checked and a final verdict is stored. GET does not start or
+resume work. A CLEAN verdict returns **200** with a payment offer, for example:
 
 ```json
 {
   "ok": true,
-  "attested": true,
+  "moderator": "<R>",
+  "attested": false,
   "verdict": "clean",
-  "riskScore": 0,
-  "specHash": "<64-hex>",
-  "attestation": { "signature": "<tx>", "recordedAt": "…", "expiresAt": "…" },
-  "policyHash": "<64-hex>",
-  "retrievable": true,
-  "pinned": false,
-  "specRegistryUri": "https://marketplace.agenc.tech/api/job-specs/<64-hex>"
+  "attestation": null,
+  "transaction": "<base64 partially signed Solana wire transaction>",
+  "lastValidBlockHeight": 123456,
+  "priceLamports": 2519520,
+  "rentLamports": 2519520,
+  "serviceFeeLamports": 0,
+  "recordPda": "<TaskModeration PDA>",
+  "signedVerdict": {
+    "body": {
+      "kind": "task-intake",
+      "verdict": "clean",
+      "creator": "<creator>",
+      "payment": {"recordPda": "<TaskModeration PDA>", "priceLamports": 2519520, "payer": "<creator>"},
+      "record": {"moderator": "<R>", "pda": "<TaskModeration PDA>", "txSignature": null}
+    },
+    "signature": "<V Ed25519 signature in hex>"
+  }
 }
 ```
 
-`jobSpecHash` is the `json-stable-v1` canonical-JSON sha-256 of the payload —
-compute it with `values.canonicalJobSpecHash` from
-[`@tetsuo-ai/marketplace-sdk`](https://www.npmjs.com/package/@tetsuo-ai/marketplace-sdk)
-or the open c14n in
-[`@tetsuo-ai/marketplace-moderation`](https://www.npmjs.com/package/@tetsuo-ai/marketplace-moderation).
-A payload that does not hash to it is rejected (422) without a verdict — the
-service never attests content the gate wouldn't check.
+The example abbreviates the signed context, repo, checks and time fields. Repo
+ID is numeric; `allowedPathsHash` and `testCommandHash` are SHA-256 of canonical
+JSON values. Non-repository intake can return its offer immediately with **200**.
 
-For a revision-5 listing hire, use the same task-specific hash that was passed
-to `hire_from_listing`. The service reads the canonical `HireRecord` and
-verifies that `jobSpecHash` equals the immutable commitment stored in the
-hired Task before it fetches, publishes, or signs anything. A legacy hired
-task with no such commitment must be cancelled and re-hired with a current
-client; direct tasks (which have no `HireRecord`) are unaffected.
+Desktop verifies the V signature and key manifest, independently reads the Task
+creator, and validates the transaction against the signed `payment` and `record`
+bindings. The transaction uses that creator as fee payer and has exactly two
+instructions, in this order (no compute-budget instructions or address tables):
 
-### Every attestation implies retrievable content
+1. SystemProgram transfer from creator to R of `rentLamports + serviceFeeLamports`.
+2. `record_task_moderation` for the signed task/hash, CLEAN status, risk score,
+   policy/scanner hashes and expiry, with R as signer and program rent payer.
 
-An attestation for a spec nobody can fetch produces a task workers can claim
-but never read. Before recording ANY attestation the service therefore
-establishes retrievability, by the first of:
+Desktop checks the record PDA, instruction accounts/data, total price, creator
+fee payer, valid R signature and absence of other instructions. It adds the
+creator signature **without modifying the message**, sends the transaction from
+its own wallet/RPC, and confirms before `lastValidBlockHeight`. The creator pays
+both the transfer and network fees. Rent comes from
+`getMinimumBalanceForRentExemption(getTaskModerationSize())`; revision 5 currently
+needs 2,519,520 lamports. `ATTESTATION_SERVICE_FEE_LAMPORTS` defaults to **0**.
+R receives rent before the program debits it, and never pays network fees: its
+balance is unchanged with a zero service fee, or increases by the service fee.
+Instruction failure rolls back the transfer and record creation atomically;
+the creator still pays the network fee. Later `close_task` returns record rent
+to **R**, as required by the unchanged program; it does not refund the creator.
 
-1. **Already retrievable** — `GET <registry>/api/job-specs/<hash>` returns
-   hash-matching content (`JOB_SPEC_REGISTRY_URL`, default the official
-   `https://marketplace.agenc.tech` registry). The agenc.ag / kit
-   `tasks create-reviewed-public` flow always publishes first, so it passes here.
-2. **Retrievable at your URI** — an https `specUri` whose bytes (or canonical
-   payload) hash to `jobSpecHash`, fetched behind the SSRF guard.
-3. **Pinned by the service** — when you sent the full payload inline, the
-   service publishes it to the registry FOR you (`PUT /api/job-specs/<hash>`,
-   authorized by `JOB_SPEC_REGISTRY_TOKEN` when configured, else by a
-   wallet-scoped upload ticket signed with the moderation signer key — an
-   off-chain signature, no extra transaction). The response then carries
-   `"pinned": true`.
+After confirmation, GET `/v1/attestations/:task/:hash` returns **200** with
+`attested:true`, `attestation.signature`, and a V-signed `record.txSignature`.
+The signature is resolved from confirmed PDA history and verified against the
+actual record instruction. There is no `transaction` or `lastValidBlockHeight`
+once paid. A valid record that already exists also returns no payment offer.
+The RPC must provide confirmed transaction history for receipt lookup.
+GET reuses one chain read per stored attestation for five seconds, so a new
+payment can take up to five seconds to show.
 
-If none succeed the request is refused with **HTTP 409
-`{ code: "SPEC_NOT_RETRIEVABLE", retryable: true }`** and no transaction is
-signed. Host the spec (registry or any public https URL) and retry. Note the
-registry is canonical-content-addressed: a legacy raw-bytes hash binding
-(`sha256(bytes)` ≠ canonical payload hash) cannot be pinned — host those exact
-bytes at an https URL and pass it as `specUri` instead.
+While a blockhash is live, repeat POST returns the identical stored offer.
+After blockheight expiry, repeat POST produces a fresh R-partially-signed
+transaction for the **same V-signed verdict, price and record expiry**, without
+another quota admission. Reissues are subject to POST rate limits. A rent
+increase beyond the originally quoted rent refuses reissue rather than exposing
+R to a debit. A new verdict after verdict expiry requires fresh intake; a live
+task cannot acquire a second hash. Hold/reject verdicts return **200** with signed
+reasons, `attestation:null`, `payment:null`, and no transaction.
 
-### Attest a listing
+Repository preflight returns **200**, `preflightOnly:true`, `wouldAttest:false`;
+it cannot predict a worker review. Repository jobs require the canonical SDK
+payload hash; legacy raw-text hashes remain supported for other intake.
 
-```bash
-curl -sX POST https://attest.agenc.ag/v1/moderation/listings \
-  -H 'content-type: application/json' \
-  -d '{ "listing": "<LISTING_PDA>" }'
+For a deliverable, Desktop posts exactly:
+
+```json
+{"task":"<task PDA>","submissionPda":"<submission PDA>","artifactSha256":"<64 lowercase hex>"}
 ```
 
-The on-chain `spec_uri` is fetched behind an SSRF guard and must hash to the
-on-chain `spec_hash`; you can also pass the payload inline (`spec`). The same
-retrievability gate applies: an inline listing spec is only attested once a
-retrievable copy is verified or pinned.
+The task must be Open, InProgress or PendingValidation with the same pinned spec
+and a clean, unexpired stored repository intake. The signer independently reads
+the submission and claim, derives the submission PDA from its claim, checks
+claim task/worker ownership, requires submission status Submitted, and binds
+`artifactSha256` to the submission's 32-byte **proofHash**. The content-addressed
+artifact uses the phase 2 format below. New review: **202**
+`{ok:true,moderator:null,attested:false,pending:true,jobId,retryAfterSeconds:5}`.
+Ready review: **200**
+`{ok:true,moderator:"<R>",attested:false,verdict,attestation:null,signedVerdict:{body,signature}}`.
+The body is `kind:"deliverable-review",scope:"repository"`, bound to submission,
+artifact, accepted intake hash, manifest, resulting tree and tests. Failing
+reviews also store signed reasons. Deliverable GET is **404** while pending,
+**200** once stored. Reviews cannot outlive their accepted intake. Each distinct
+submission/artifact consumes creator scanner quota; retries consume none.
 
-### Store templates / kit-backend compatibility
+Errors use `{ok:false,moderator:null,error:"Request could not be completed.",logId}`:
+**400** malformed input or JSON depth limit, **401** missing configured Desktop API key, **403**
+creator/worker authentication failure, **404** missing task/submission/result,
+**409** task/hash/submission/lease conflicts, changed policy, unavailable spec, or a
+`specUri` that differs from the one the intake was opened with,
+**413** body size limit, **422** hash mismatch or invalid GitHub spec, **429**
+IP/creator quota or outstanding-transaction cap, **502** upstream/recheck/chain failure, **503**
+unavailable R/V/worker/roster or invalid payment configuration. Spec retrievability errors also carry
+`code:"SPEC_NOT_RETRIEVABLE",retryable:true`. IP 429 includes `retryAfterSeconds`
+and a `Retry-After` header. GET routes other than health, policy and
+`/openapi.json` have their own limits: `RATE_LIMIT_GET_PER_IP` (default 60) and
+`RATE_LIMIT_GET_GLOBAL` (default 600) per window. See `/openapi.json` for request/response schemas.
 
-`POST /api/task-moderation/attest` accepts the request shape used by
-`create-agenc-store` stores (`store-core`'s remote attestor) and the hosted
-kit backend's route, and answers `{ attested, moderation, txSignature }`.
-Point `moderation.attestorEndpoint` in your store config at
-`https://attest.agenc.ag/api/task-moderation/attest` — no other change needed.
+Listing writes return 410. POST responses have no CORS headers. Compat returns
+`moderation.status` and `verdict` as `clean`, `suspicious`, or `blocked`, and always
+includes `moderator`. `preflightOnly:true` never signs any message or transaction,
+pays rent, consumes a nonce, or pins; it returns `attested:false`, `preflightOnly:true`
+and `wouldAttest`. A true `wouldAttest` means the scanner and task binding pass
+with R configured; quota, outstanding-capacity, custody and retrievability checks still apply at intake.
 
-## Verdicts
+Tasks must exist and be Open with `currentWorkers=0` and `completions=0`. Binding
+requires `description[0..32] == jobSpecHash`, or creator authorization. A different
+pinned TaskJobSpec hash is refused. Revision 5 listing hires use the second half
+of description for their task-specific commitment; those creators must explicitly
+authorize intake. Hash resolution preserves the SDK canonical payload binding and
+legacy SHA-256 of exact raw bytes. When text is supplied, those bytes determine
+the scanned content rather than any separately supplied object.
 
-| Verdict      | riskScore | On-chain attestation |
-| ------------ | --------- | -------------------- |
-| `clean`      | 0         | recorded (status CLEAN) |
-| `suspicious` | 60        | **held** — advisory only |
-| `blocked`    | 100       | **held** |
+`creatorAuthorization` is `{issuedAt, nonce, signature}`. Nonce is 16–64 bytes as
+lowercase hex; signature is 64-byte Ed25519 lowercase hex. `issuedAt` is canonical
+ISO UTC, at most five minutes old and at most 30 seconds ahead. Sign these UTF-8
+bytes with the task's creator wallet, with no trailing newline:
 
-The full policy (rules, scanned text surface, appeals) is the served document
-at `GET /v1/policy`; its sha-256 **is** the `policy_hash` in every attestation.
-Attestations expire after the deployment-disclosed TTL
-(`GET /v1/info` → `attestationTtlSeconds`; the hosted deployment uses 30 days).
-
-## Self-host your own attestor
-
-One codebase, three ways to run it:
-
-```bash
-# npx (Node 22.23.1+)
-MODERATION_SIGNER_SECRET='[...]' RPC_URL=https://your-rpc \
-  npx @tetsuo-ai/agenc-moderation-api
-
-# docker
-docker build -t agenc-moderation-api .
-docker run -p 8787:8787 \
-  -e MODERATION_SIGNER_SECRET='[...]' -e RPC_URL=https://your-rpc \
-  agenc-moderation-api
-
-# vercel (this repo deploys as-is)
-vercel deploy
+```text
+AgenC attestation request v1
+creator=<pubkey>
+task=<pda>
+jobSpecHash=<lowercase hex>
+issuedAt=<iso>
+nonce=<lowercase hex>
 ```
 
-Configuration is env-only — see [.env.example](.env.example). Without a
-signer key the service runs in **verdict-only mode** (scans and reports, never
-records).
+A verified authorization nonce is single use even if later checks refuse intake.
+For an unexpired admitted intake, the exact originally accepted
+authorization can be reused, including after its initial five-minute window;
+that durable authorization stays bound to the same task, hash and creator. Other
+requests require a fresh authorization, or the commitment-bound path.
 
-### Whose key can sign?
+## Verdicts and offline keys
 
-**Any wallet — roster registration is permissionless.** The deployed program
-accepts attestations from **either**:
+R is the AgenC on-chain roster key and program rent payer; V is a separate Ed25519 verdict key. Provision
+R as a Solana 64-byte JSON keypair file via `MODERATION_SIGNER_SECRET_FILE` and V
+as PKCS8 PEM via `VERDICT_KEY_FILE`. Both work with systemd credentials. Production
+refuses `MODERATION_SIGNER_SECRET`, `MODERATION_AUTHORITY_SECRET`, and
+`VERDICT_KEY_SECRET` environment secrets. Startup fails if required keys or the
+manifest are invalid. The service never loads an offline root private key.
 
-- the cluster's global `moderation_authority`
-  (`ModerationConfig.moderation_authority`), or
-- any wallet registered on the **moderation-attestor roster**. Roster
-  attestations satisfy the publish/hire gates exactly like the global
-  authority's (live on mainnet since the 2026-07-02 roster-gates upgrade),
-  and since the 2026-07-03 P1.2 open-roster upgrade **anyone can
-  self-register** — no approval, no issue to open, no tetsuo involvement.
+`KEY_MANIFEST_FILE` contains `{body,signature}`. `ROOT_PUBLIC_KEY` is the trusted
+base58 root public key. The body has this shape:
 
-The service auto-detects which one your key is and attaches the roster PDA
-when needed. A key that is neither is rejected up front (503) with the exact
-registration it needs.
-
-#### Register your signer on the roster (mainnet, self-service)
-
-`register_moderation_attestor` self-registers the signing wallet by
-depositing a **0.25 SOL refundable bond** (plus the roster PDA's rent, ~0.002
-SOL) on its own `["moderation_attestor", <pubkey>]` PDA. The bond is an
-attributable-identity deposit — it is **never confiscatable** and is refunded
-in full when you exit. Build the instruction with the marketplace SDK
-(`@tetsuo-ai/marketplace-sdk` ^0.12.0):
-
-```ts
-import { facade } from "@tetsuo-ai/marketplace-sdk";
-
-// attestor: a TransactionSigner for the dedicated attestation wallet
-// (the same key you set as MODERATION_SIGNER_SECRET)
-const ix = await facade.registerModerationAttestor({ attestor });
-// sign + send `ix` with any @solana/kit transaction pipeline; the wallet
-// pays the PDA rent and the 0.25 SOL bond in the same instruction
+```json
+{
+  "v": 1,
+  "issuedAt": "2026-10-11T00:00:00.000Z",
+  "expiresAt": "2027-01-01T00:00:00.000Z",
+  "keys": [{
+    "keyId": "desktop-V1",
+    "purpose": "verdict",
+    "publicKey": "<V base58 public key>",
+    "notBefore": "2026-10-11T00:00:00.000Z",
+    "notAfter": "2027-01-01T00:00:00.000Z"
+  }]
+}
 ```
 
-Fund the wallet with the bond + rent + a small fee float first. Registering
-an already-rostered wallet fails (that is the "already registered" signal).
+On an offline machine, sign `0xff || "agenc-desktop-keys/v1" || 0x00 ||
+canonicalJson(body)` with the root key; put its lowercase hex Ed25519 signature
+in the envelope. Canonical JSON sorts object keys recursively, preserves array
+order, emits compact JSON and UTF-8. Deploy only that envelope and root public
+key. V must be a currently valid `purpose:verdict` manifest entry and differ from R.
+Rotate V by provisioning a new offline-signed manifest and credential; retain
+historical public keys for verification for at least the 72-hour verdict TTL.
 
-To leave the roster: `facade.requestAttestorExit({ attestor })` — the program
-rejects the key's attestations from the **moment the exit is requested** —
-then, after the **7-day cooldown**, `facade.finalizeAttestorExit({ attestor })`
-closes the PDA and refunds **everything** (bond + rent) to the wallet.
-Re-registering later re-inits a fresh entry.
+`signedVerdict` is `{body,signature}`, over `0xff ||
+"agenc-desktop-attestation/v1" || 0x00 || canonicalJson(body)`. Body fields are
+`v`, `kind:task-intake`, `cluster`, `genesisHash`, `programId`, `taskPda`, `creator`,
+`jobSpecHash`, `jobSpecUri`, optional `repo`, `policyHash`, `scannerHash`, `verdict`,
+`riskScore`, `categories`, `reasons`, `payment:{recordPda,priceLamports,payer}`
+(or null without an offer), `record:{moderator,pda,txSignature}`,
+`issuedAt`, `expiresAt`, `nonce`, `keyId`. Expiry is 72 hours, capped by an existing
+record's expiry when reused. Repo metadata, when present, must include `id`,
+`owner`, `name`, `licenseSpdx`, 40-hex `baseCommit` and `treeSha`, 64-hex
+`allowedPathsHash` and `testCommandHash`, and positive integer `maxDiffBytes`.
+For `scope:repository`, these fields come from the independently rechecked worker
+report and committed `custom.github` limits. General phase 1 `payload.repo`
+metadata alone is a spec commitment and does not constitute repository screening.
 
-### Key custody
+## Persistent controls
 
-- Generate a **dedicated keypair** for attestation — never reuse a treasury or
-  upgrade key. `solana-keygen new -o attestor.json`, fund it with a little SOL
-  (each attestation pays a tx fee + the moderation PDA's rent).
-- Inject it via your platform's secret store (Vercel env var, docker/k8s
-  secret, systemd `LoadCredential`) — never commit it, never pass it in shell
-  history if avoidable.
-- The service **never logs the key** and only ever signs
-  `record_task_moderation` / `record_listing_moderation` with it.
-- Bound abuse: keep the rate limits on (they cap how fast anyone can drain the
-  key's fee balance). **On serverless (Vercel), provision Upstash
-  (`KV_REST_API_URL`/`KV_REST_API_TOKEN`)** — the global ceiling is only truly
-  service-wide with a shared store, and the limiter now **fails closed** (429s
-  briefly) if a configured store is unreachable rather than silently degrading
-  to a per-instance count that autoscaling would multiply. `GET /v1/info`
-  reports the active mode (`rateLimit.mode`: `shared` vs `per-instance`).
-  Single-instance self-host (docker/npx) is fine on the in-memory limiter.
-- Fund the signer wallet with only a **small, bounded** SOL balance — it is the
-  ultimate cap: even if every other layer were bypassed, the key can spend no
-  more than it holds. Top it up deliberately, not with a large float.
-- If the key is compromised: rotate. For a self-registered roster key, request
-  the attestor exit (`request_attestor_exit` — its attestations are rejected
-  from that moment), finalize after the 7-day cooldown to recover the bond,
-  and register a fresh key (registration is permissionless, so the new key is
-  live immediately). For an authority-deputized key, revoke it
-  (`revoke_moderation_attestor`); for the global authority, move the
-  authority. Attestations already recorded stay valid until expiry.
+`ATTESTATION_DB_PATH` defaults to `./data/attestations.sqlite`. Use durable local
+storage, one signer service per R key, and preserve the database and WAL through
+restart/upgrade. SQLite FULL synchronization and immediate transactions serialize
+admissions and offer publication; concurrent builders return the stored winner.
+Defaults are 20 intakes per creator per rolling day, five distinct tasks per hour,
+and five outstanding creator payment slots (`CREATOR_OUTSTANDING_TRANSACTIONS`).
+Queued repository jobs reserve a slot; a hold/reject verdict releases it, while
+a CLEAN offer keeps it until payment is reconciled or its verdict expires.
+Blockhash expiry alone keeps the slot so the same offer can be reissued. Reissues
+consume no additional slot. Set a quota/cap to zero to stop new intake. IP and
+global POST limits also bound reissues. See [service.env.example](deploy/service.env.example).
 
-### Localnet quickstart (zero → signing)
+Task records have no spend-ledger or wallet-floor dependency. No service path
+pays Solana transaction fees; R only needs a small balance for operator-managed
+roster maintenance. For a nonzero service fee, retain the ordinary rent-exempt
+minimum for its system wallet; a zero-to-dust wallet transition can fail Solana
+runtime rent checks. This introduces no service-funded transaction fees. Legacy `SPEND_HOURLY_LAMPORTS`, `SPEND_DAILY_LAMPORTS` and
+`WALLET_FLOOR_LAMPORTS` settings have no effect on task intake. Historical spend
+rows remain for operator reconciliation; old
+`reserved`/`pending` entries cannot be automatically replaced. Inspect their
+chain state before modifying the journal. Existing signed verdicts whose policy
+binding changed need operator review.
 
-Against the agenc-protocol localnet stack:
+The `audit`, `admissions`, `intake_bindings`, `nonces`, `jobs`, and `intakes` tables
+retain quotas, authorizations, payment offers and receipts. Restrict DB access
+to the signer OS user and back it up consistently. Request failures return a
+generic message and `logId`; logs store the ID and error type without request
+contents or upstream error details.
 
-```bash
-# 1. in agenc-protocol: boot localnet with the program + a ModerationConfig
-scripts/localnet-up
+Pinning defaults off. Enable only with `ENABLE_SPEC_PINNING=1`, an operator
+`JOB_SPEC_REGISTRY_TOKEN`, and a valid creator-wallet authorization. A description
+commitment alone never grants registry write authorization. R and V never sign
+registry tickets. Existing registry objects or public HTTPS specs can satisfy
+retrievability without writes.
 
-# 2. run the attestor pointed at it, with the localnet moderation key
-MODERATION_SIGNER_SECRET="$(cat .localnet/moderation-authority.json)" \
-RPC_URL=http://127.0.0.1:8899 CLUSTER_LABEL=localnet ATTESTATION_TTL_SECONDS=0 \
-  npx @tetsuo-ai/agenc-moderation-api
+## DigitalOcean droplet
 
-# 3. attest a task created on localnet
-curl -sX POST localhost:8787/v1/moderation/tasks -H 'content-type: application/json' \
-  -d '{"task":"<TASK_PDA>","jobSpecHash":"<hex>","spec":{...}}'
+Use Node 24 (the container pins Node 24.14.0 by digest) and a current systemd with
+`LoadCredentialEncrypted` support. Build the source with `npm ci`,
+`npm run typecheck`, `npm test`, and `npm run build`; copy the built release to
+`/opt/agenc-attestor` owned by root. This repository provides deployment templates;
+applying them is an operator action.
+
+Use separate OS users: `agenc-api` for the nginx HTTP/API edge worker, and
+`agenc-signer` for the attestor Node process. Configure nginx's main `user`
+directive to `agenc-api`; the signer user owns only its credential runtime directory
+and `/var/lib/agenc-attestor`. The nginx user must have no access to R, V, the DB,
+or encrypted credential source files. This isolates the edge from key custody;
+phase 1's trusted router and signing core share the signer process. A separate
+signing daemon with an independent authorization protocol remains future work.
+
+Provision the R JSON file and V PEM using `systemd-creds encrypt` on the droplet
+into `/etc/credstore.encrypted/agenc-moderation.key` and `agenc-verdict.pem`,
+then remove plaintext provisioning copies. Keep encrypted files root-only.
+Install the offline-signed `keys.json` in `/etc/agenc-attestor`, copy
+`deploy/service.env.example` to `/etc/agenc-attestor/service.env`, and configure
+RPC, cluster and root public key. Install [agenc-attestor.service](deploy/agenc-attestor.service).
+The service binds `127.0.0.1:8787`; the droplet firewall must expose only nginx
+TLS and operator SSH, never port 8787.
+
+Install [nginx.conf](deploy/nginx.conf) inside nginx's `http` context, replace the
+hostname and TLS paths, and validate nginx configuration before reload. It replaces
+inbound X-Forwarded-For with the socket client address, strips other IP headers,
+sets request limits and a 512 KiB body cap. `TRUST_PROXY=1` is safe only with this
+loopback-only listener behind the configured edge. Without it, Node uses the
+socket peer address and ignores all IP headers. Allow only trusted OS users on the
+host because they can access loopback.
+
+The unit uses systemd encrypted credentials, a private state directory, no
+capabilities, restricted address families, read-only system paths, protected
+kernel settings and process limits. Use journalctl for `logId` correlation.
+`GET /v1/health` is liveness; monitor wallet balance, pending reservations,
+manifest expiry, disk space and RPC health separately.
+
+Alternatively build `docker build -f deploy/Dockerfile .`; mount a durable `/data`,
+read-only credential files and manifest, configure their file paths, and bind the
+published port to loopback for nginx. The image is digest-pinned and has a
+HEALTHCHECK. Never put key bytes in Docker environment variables.
+
+## Phase 2
+
+`worker/` is a sequential queue consumer. Jobs are `{kind:"repo-intake" |
+"deliverable", taskPda, jobSpecHash, github, artifact?}`. `github` is the exact
+`payload.custom.github` object from the canonical committed job spec:
+
+```json
+{
+  "owner": "example", "repo": "public-repo", "license": "MIT",
+  "baseCommit": "<40 lowercase hex>", "workType": "bugfix",
+  "allowedPaths": ["src"], "maxDiffBytes": 100000,
+  "testCommand": "npm test", "needsNetworkForInstall": true
+}
 ```
 
-## Verify a deployment
+Optional `issueUrl` must name an issue in the same GitHub repository. Allowed
+paths are literal relative file/directory prefixes, never globs, `.` or `.git`.
+All touched old/new paths must remain inside them. SHA values are lowercase hex.
+Deliverable jobs also have `artifact:{sha256,submissionPda}`. The report signature
+uses a separate `0xff || "agenc-worker-report/v1" || 0x00 || canonicalJson(body)`
+domain. A report key authenticates a worker, has no verdict authority, and differs
+from every V/R key. The controller holds only its report key; every scanner
+container receives zero credentials. Reports expire after ten minutes; signer
+replay prevention uses an atomic durable nonce guard.
 
-`GET /v1/info` discloses the signer pubkey, cluster, `policyHash`,
-`scannerHash` (+ the descriptor string it hashes), and the attestation TTL.
-Re-derive both hashes from this repo's `src/policy.ts` / `src/scan.ts` to
-check a deployment runs the published policy.
+The worker resolves named repos to numeric IDs, re-reads public/non-archived/
+enabled metadata by ID, checks size/default branch, compares API SPDX and actual
+LICENSE grant text, checks base ancestry and records the immutable tree SHA.
+The allowlist is MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause and ISC. Missing,
+ambiguous or inconsistent licensing rejects. The container's LICENSE bytes and
+tree must match the API facts. Scans cover install hooks/config, executables,
+archives/large blobs, workflow risks, unsafe paths/symlinks/case collisions,
+confusable filenames in allowed paths, secrets, allowed-path existence, test
+runner and agent instructions. Instruction filenames are recorded; detected
+injection rejects. Non-ASCII filenames in allowed paths conservatively reject.
+Each check returns `pass`, `hold` or `reject`; any rejection wins, otherwise any
+hold wins. Unknown formats, quota failures and API outages never become passes.
 
-## Development
+The initial executable runner is `npm test` or `npm run <script>`, with root
+package-lock/npm-shrinkwrap v2/v3, registry.npmjs.org sources and SHA-512 integrity.
+Missing/other/nested/ambiguous lockfiles or other runners hold. Install hooks,
+symlinks, native blobs and risky workflows hold or reject before execution.
+Dependency versions (including transitive and dev dependencies) are queried
+against OSV in bounded batches; advisories, partial/paginated responses and
+outages hold. This support limit intentionally requires review for other
+ecosystems. Tests execute only after all preceding checks pass.
 
-```bash
-npm install
-npm run typecheck && npm test   # 55 tests: scan vectors, fail-closed hash
-                                # binding, policy pin, router/gates
-npm run build && npm start      # self-host on :8787
+Artifact registry GET `/artifacts/<sha256>` must return `{bytesBase64}` containing
+the exact UTF-8 object bytes `{manifest,patchBase64}`; the outer SHA commits to
+those bytes. The manifest contains `repo:{id,owner,name}`, `baseCommit`,
+`headCommit`, `patchSha256`, and may contain extra provenance. The patch digest
+is checked independently. The exact attested base/repo is mandatory. The worker
+checks byte size, textual paths, binary/symlink hunks, sensitive changes and
+secrets, then verifies `git apply --check --index`, applies it and checks the
+actual staged delta and resulting tree. The head commit must be retrievable from
+GitHub, descend from the base and have exactly that tree. Unpublished heads hold.
+Resulting dependency additions/versions receive OSV queries. Changes to install
+hooks, registry URLs, CI, git config or instruction files hold. npm installation
+uses `--ignore-scripts` from the reviewed lockfile; tests have no network, with
+time, memory, pids, CPU and tmpfs caps. Reports expose output hashes, not logs
+containing possible secrets.
+
+`reviewWorkerReport` in [src/repo-review.ts](src/repo-review.ts) is an internal
+signer function, exported from the package. Supply a trusted context resolver
+that uses phase 1 creator binding and independent task/spec/submission reads,
+the worker public-key allowlist, pinned scanner digest, root-authorized intake V
+keys and a durable nonce guard. It canonicalizes the declared spec itself,
+verifies the report and required checks, rechecks GitHub identity/license/base/
+tree and deliverable head facts, then calls the existing `signDocument` with V.
+`scannerHash` commits to the actual rule source files, parser/transport/sandbox/
+signer code, dependency lock, compiled JavaScript bundle, limits and worker image digest. Ship identical
+read-only source and compiled releases on signer and worker. Reports from other
+rules/images are refused. Worker signatures cannot serve as verdict signatures.
+
+Repo intake yields a signed `kind:"task-intake",scope:"repository"` with repo
+binding; deliverables yield `kind:"deliverable-review",scope:"repository"`
+bound to `taskPda`, `submissionPda`, `artifactSha256`, manifest, resulting tree,
+test result and `intakeHash`. Verdicts map to `clean`/`suspicious`/`blocked`.
+Clean intake documents include the R moderation PDA/transaction after the
+queue adapter records it. Held/rejected intakes and all deliverable reviews have
+`record.pda:null,txSignature:null`. The HTTP adapter requires worker review for
+every `custom.github` intake and cannot use general phase 1 scanning to bypass it.
+`GET /v1/info` exposes the repository image and scanner commitments separately
+from the general payload scanner.
+
+Desktop must verify a deliverable-review **before** acceptance/settlement:
+
+1. Verify the root-signed key manifest, V purpose, validity/revocation and the
+   exact verdict-domain Ed25519 signature, never the worker report signature.
+2. Require `v:1`, `kind:deliverable-review`, `scope:repository`, `verdict:clean`,
+   valid issued/expiry times, expected cluster/genesis/program, current policy
+   and scanner/image commitments, and every mandatory check passing.
+3. Match task/creator/canonical jobSpecHash to independently read task/spec data;
+   match submissionPda and artifactSha256 to the actual submission and downloaded
+   artifact bytes. Check manifest patch digest, repo ID/owner/name and exact base.
+4. Verify the accepted repository intake, its repo/tree/allowedPaths/testCommand/
+   maxDiffBytes bindings and `intakeHash`; the review must not outlive the intake.
+   Check head/resultTreeSha and successful, non-timeout test evidence. Never
+   interpret a repository verdict as an on-chain paid record or general payload
+   moderation; retain revision 5 gates and general task policy checks.
+
+See [deploy/WORKER.md](deploy/WORKER.md) for the separate DigitalOcean worker
+unit, offline compose qualification profile, nftables egress allowlist, queue
+contract, required image qualification and hostname-gateway limitations. No
+templates have been applied. Real-container/egress qualification, droplet deployment, R roster registration,
+offline root/V ceremony and Desktop verdict consumption remain operator/client
+integration work. The durable queue and trusted context adapter are implemented. Heuristic license, secret, YAML and instruction
+scans cannot prove arbitrary repository code safe; compromised report keys or
+container/engine vulnerabilities remain risks even for a passing report.
+
+## Worker transport and local development
+
+Set `WORKER_KEYS_FILE` to a signer-readable JSON map
+`{"scanner-do-1":"<worker report Ed25519 base58 public key>"}` and
+`WORKER_IMAGE_DIGEST=sha256:<64 hex>` on the signer. Configure the identical
+image digest and `queueUrl:"https://attestor.example.com"` on the worker.
+The worker binary processes one lease at a time; no Desktop API key is needed.
+The signer owns the SQLite queue; the scanner never opens the signing database.
+
+`POST /internal/worker/pull` and `POST /internal/worker/reports` take
+`{body,signature}`. Body is
+`{workerId,path,issuedAt,nonce,payload}`. Sign with the worker report credential
+using `0xff || "agenc-worker-queue/v1" || 0x00 || canonicalJson(body)`; the path
+must equal the actual endpoint, time must be within 60 seconds (30 seconds future
+skew allowed), and nonce is fresh 16-byte lowercase hex. Nonces are durable.
+Pull payload is `{}`. Pull returns **200**
+`{moderator:null,jobId,leaseToken,leaseExpiresAt,job}` or **204** with no body.
+The lease lasts 15 minutes, covering the worker's ten-minute job bound.
+
+Report payload is `{jobId,leaseToken,report:{body,signature}}`; the inner report
+uses the existing separate report domain. A report must name the leased job and
+worker, match the current bundle/image, and pass signer binding/rechecks.
+Acknowledgement is **200** `{moderator:null,accepted:true,jobId}` after atomic
+report+replay-nonce storage. A duplicate exact report is acknowledged under a
+fresh transport nonce; a different report is **409**. Forgery is **403**; missing,
+expired or superseded lease is **409**. Crash recovery redelivers unfinished
+leases; reviewed jobs resume through Desktop POST. Chain failures after durable
+report acceptance do not discard the report or trigger another payment.
+
+Restrict these endpoints at nginx and the droplet ingress firewall to the fixed
+worker droplet IP. The public Desktop location must not provide an alternative
+route to them; direct port 8787 remains loopback-only. Add the signer TLS host to
+the controller's approved egress configuration. See [deploy/WORKER.md](deploy/WORKER.md)
+and [deploy/nginx.conf](deploy/nginx.conf); these templates have not been applied.
+
+Development can use `runDevelopmentWorkerOnce(attestDeps, workerDeps)` from the
+package. It pulls from the same persistent queue and runs `processJob` in process;
+inject a mocked `Sandbox` (clone/apply/test/close), GitHub, registry/OSV and RPC.
+It is disabled under `NODE_ENV=production`. This is dependency injection, not an
+automatic success report or a container daemon. The complete local examples are
+[test/repo-queue.test.ts](test/repo-queue.test.ts), including payment offers and
+signature verification. [test/payment-litesvm.test.ts](test/payment-litesvm.test.ts)
+loads the SDK's bundled compiled `agenc_coordination.so` in LiteSVM using
+throwaway keys. It executes the actual API offer after creator co-signing, checks
+R's balance and exact rent, exercises failure rollback, and verifies that
+`close_task` returns the rent to R. No live RPC or container daemon is used:
+
+```sh
+npm test -- --maxWorkers=2
+npm run typecheck
 ```
-
-MIT. Part of the AgenC protocol's neutral shared services (WP-C1/WP-C2):
-moderation must never be a setup step for integrators, and never a point of
-central control — run your own.

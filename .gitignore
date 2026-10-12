@@ -10,3 +10,8 @@ dist/
 
 !.env.example
 public/
+
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

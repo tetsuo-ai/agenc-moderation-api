@@ -1,3 +1,4 @@
+import { socketIp } from './node-adapter.js';
 /**
  * Fixed-window rate limiter: a strict per-IP bound PLUS a GLOBAL ceiling — the
  * real economic bound on the hot moderation key, which signs + pays a mainnet
@@ -133,24 +134,31 @@ async function consume(
   };
 }
 
+/** POST spends the signer budget; GET has its own, higher budget for reads. */
+export type RateScope = "post" | "get";
+
 /**
  * Consume one request against BOTH the per-IP bound and the global ceiling.
  * Exceeding either denies; a configured-shared-store error also denies
  * (fail-closed) so the hot-key spend bound can't silently weaken.
  */
-export async function rateLimit(config: ServiceConfig, ip: string): Promise<RateDecision> {
-  const perIp = await consume(config, `ip:${ip}`);
+export async function rateLimit(config: ServiceConfig, ip: string, scope: RateScope = "post"): Promise<RateDecision> {
+  // Separate counters, so reads never use up the POST budget.
+  const prefix = scope === "get" ? "get:" : "";
+  const perIpLimit = scope === "get" ? config.rateLimitGetPerIp : config.rateLimitPerIp;
+  const globalLimit = scope === "get" ? config.rateLimitGetGlobal : config.rateLimitGlobal;
+  const perIp = await consume(config, `${prefix}ip:${ip}`);
   if (perIp === null) {
     return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
   }
-  if (perIp.count > config.rateLimitPerIp) {
+  if (perIp.count > perIpLimit) {
     return { allowed: false, retryAfterSeconds: perIp.retryAfterSeconds, deniedBy: "ip" };
   }
-  const global = await consume(config, "global");
+  const global = await consume(config, `${prefix}global`);
   if (global === null) {
     return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
   }
-  if (global.count > config.rateLimitGlobal) {
+  if (global.count > globalLimit) {
     return { allowed: false, retryAfterSeconds: global.retryAfterSeconds, deniedBy: "global" };
   }
   return { allowed: true, retryAfterSeconds: 0, deniedBy: null };
@@ -166,17 +174,29 @@ export async function rateLimit(config: ServiceConfig, ip: string): Promise<Rate
  * untrusted network the global ceiling remains the backstop.
  */
 export function clientIp(request: Request): string {
-  const platform =
-    request.headers.get("x-vercel-forwarded-for")?.trim() ||
-    request.headers.get("x-real-ip")?.trim();
-  if (platform) return platform;
-  const fwd = request.headers.get("x-forwarded-for");
-  if (fwd) {
-    const hops = fwd.split(",").map((h) => h.trim()).filter(Boolean);
-    const rightmost = hops[hops.length - 1];
-    if (rightmost) return rightmost;
+  if(process.env.TRUST_PROXY === '1') {
+    const ip = request.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim();
+    if(ip) return ip;
   }
-  return "unknown";
+  return socketIp(request) ?? 'unknown';
+}
+
+/**
+ * The key a client is counted under. One host usually holds a whole IPv6 /64,
+ * so counting each address apart would let it spend the global budget alone:
+ * IPv6 is counted per /64. IPv4 (also IPv4-mapped IPv6) stays per address.
+ */
+export function rateKey(ip: string): string {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return mapped[1]!;
+  if (!ip.includes(':')) return ip;
+  const [head = '', tail = ''] = ip.split('%')[0]!.toLowerCase().split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  if (left.length + right.length > 8 || [...left, ...right].some(part => !/^[0-9a-f]{1,4}$/.test(part))) return ip;
+  const groups = ip.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
+  if (groups.length !== 8) return ip;
+  return `${groups.slice(0, 4).map(part => part.replace(/^0+(?=.)/, '')).join(':')}::/64`;
 }
 
 /** Test hook. */

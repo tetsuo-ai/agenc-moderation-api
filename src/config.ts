@@ -1,14 +1,17 @@
-/**
- * Environment-driven service configuration. Everything has a safe default so a
- * self-hoster can boot with nothing but a signer key; every knob is disclosed
- * (minus secrets) at `GET /v1/info`.
- */
+import { readFileSync } from 'node:fs';
+/** Non-secret environment configuration for the single-host attestor. */
 
 import { DEFAULT_JOB_SPEC_REGISTRY_URL } from "./retrievability.js";
 
 export interface ServiceConfig {
-  /** Solana RPC endpoint the service reads state from and sends attest txs to. */
+  /** Solana RPC endpoint for read-only task, rent and confirmation queries. */
   rpcUrl: string;
+  repositoryWorkers: Record<string,string>;
+  repositoryImageDigest: string | null;
+  pinEnabled: boolean;
+  storePath: string;
+  attestationServiceFeeLamports: number;
+  spendLimits: import('./store.js').SpendLimits;
   /** Human label for the cluster (info/reporting only; the RPC is the truth). */
   cluster: string;
   /**
@@ -17,16 +20,9 @@ export interface ServiceConfig {
    * this service. Default: the official marketplace registry.
    */
   jobSpecRegistryUrl: string;
-  /**
-   * Optional operator write token for registry pins (Authorization: Bearer).
-   * When unset, pins fall back to wallet-scoped upload tickets signed by the
-   * moderation signer key (an off-chain signature — no transaction).
-   */
+  /** Operator token for explicitly enabled, creator-authenticated pins. */
   jobSpecRegistryToken: string | null;
-  /**
-   * Attestation TTL in seconds. `expires_at = recordedAt + ttl`; 0 disables
-   * expiry (matches the historical first-party behavior). Default 30 days.
-   */
+  /** Fixed 72-hour intake TTL. */
   attestationTtlSeconds: number;
   /**
    * Optional bearer API keys. When non-empty, POST endpoints require
@@ -37,10 +33,14 @@ export interface ServiceConfig {
   /** Per-IP requests per window for POST endpoints. */
   rateLimitPerIp: number;
   /**
-   * GLOBAL POST ceiling per window across all callers — the economic bound on
-   * the hot signer key (each CLEAN attest signs + pays a mainnet tx).
+   * GLOBAL POST ceiling per window across all callers — a bound on signer work,
+   * including payment transaction reissues.
    */
   rateLimitGlobal: number;
+  /** Per-IP requests per window for GET routes other than health, policy and the OpenAPI document. */
+  rateLimitGetPerIp: number;
+  /** GLOBAL GET ceiling per window, a bound on the RPC reads attestation GETs can cause. */
+  rateLimitGetGlobal: number;
   /** Rate-limit window in milliseconds. */
   rateLimitWindowMs: number;
   /** Optional Upstash REST binding for a cross-instance shared limiter. */
@@ -56,29 +56,41 @@ function intEnv(name: string, fallback: number, min = 0): number {
   return parsed;
 }
 
+function safeIntEnv(name:string,fallback:number): number {
+  const raw=process.env[name];
+  if(raw === undefined || raw.trim() === '') return fallback;
+  if(!/^\d+$/.test(raw.trim()) || !Number.isSafeInteger(Number(raw))) throw new Error(`Invalid ${name}`);
+  return Number(raw);
+}
+
 function nonEmpty(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
 }
 
-export const DEFAULT_ATTESTATION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+export const DEFAULT_ATTESTATION_TTL_SECONDS = 72 * 60 * 60; // 72 hours
 
 export function loadConfig(): ServiceConfig {
   return {
+    repositoryWorkers: process.env.WORKER_KEYS_FILE ? JSON.parse(readFileSync(process.env.WORKER_KEYS_FILE,'utf8')) : {},
+    repositoryImageDigest: nonEmpty(process.env.WORKER_IMAGE_DIGEST),
+    pinEnabled: process.env.ENABLE_SPEC_PINNING === '1',
+    storePath: process.env.ATTESTATION_DB_PATH ?? './data/attestations.sqlite',
+    attestationServiceFeeLamports: safeIntEnv('ATTESTATION_SERVICE_FEE_LAMPORTS',0),
+    spendLimits: {outstandingTransactions:safeIntEnv('CREATOR_OUTSTANDING_TRANSACTIONS',5),hourlyLamports:intEnv('SPEND_HOURLY_LAMPORTS',30_000_000),dailyLamports:intEnv('SPEND_DAILY_LAMPORTS',150_000_000),dailyIntakes:intEnv('CREATOR_DAILY_INTAKES',20),hourlyTasks:intEnv('CREATOR_HOURLY_TASKS',5),walletFloor:intEnv('WALLET_FLOOR_LAMPORTS',100_000_000)},
     rpcUrl: nonEmpty(process.env.RPC_URL) ?? "https://api.mainnet-beta.solana.com",
     cluster: nonEmpty(process.env.CLUSTER_LABEL) ?? "mainnet",
     jobSpecRegistryUrl: nonEmpty(process.env.JOB_SPEC_REGISTRY_URL) ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
     jobSpecRegistryToken: nonEmpty(process.env.JOB_SPEC_REGISTRY_TOKEN),
-    attestationTtlSeconds: intEnv(
-      "ATTESTATION_TTL_SECONDS",
-      DEFAULT_ATTESTATION_TTL_SECONDS,
-    ),
+    attestationTtlSeconds: DEFAULT_ATTESTATION_TTL_SECONDS,
     apiKeys: (process.env.ATTEST_API_KEYS ?? "")
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean),
     rateLimitPerIp: intEnv("RATE_LIMIT_PER_IP", 6, 1),
     rateLimitGlobal: intEnv("RATE_LIMIT_GLOBAL", 60, 1),
+    rateLimitGetPerIp: intEnv("RATE_LIMIT_GET_PER_IP", 60, 1),
+    rateLimitGetGlobal: intEnv("RATE_LIMIT_GET_GLOBAL", 600, 1),
     rateLimitWindowMs: intEnv("RATE_LIMIT_WINDOW_MS", 60_000, 1_000),
     upstashUrl: nonEmpty(process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL),
     upstashToken: nonEmpty(process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN),

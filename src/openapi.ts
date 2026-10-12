@@ -1,269 +1,53 @@
-/**
- * The OpenAPI 3.1 document served at GET /openapi.json. Static by design —
- * regenerating at request time from types would drag a schema library into the
- * runtime; this service's surface is small enough to state exactly.
- */
-
-import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
-
-const moderationResult = {
-  type: "object",
-  required: ["ok", "attested", "verdict", "riskScore", "specHash", "attestation", "policyHash"],
-  properties: {
-    ok: { type: "boolean" },
-    attested: {
-      type: "boolean",
-      description: "True when a CLEAN verdict was recorded on-chain.",
-    },
-    verdict: { type: "string", enum: ["clean", "suspicious", "blocked"] },
-    riskScore: { type: "integer", minimum: 0, maximum: 100 },
-    specHash: {
-      type: "string",
-      pattern: "^[0-9a-f]{64}$",
-      description: "Canonical json-stable-v1 spec hash — equals the on-chain job_spec_hash.",
-    },
-    attestation: {
-      oneOf: [
-        {
-          type: "object",
-          required: ["signature", "recordedAt"],
-          properties: {
-            signature: { type: "string", description: "record_*_moderation tx signature." },
-            recordedAt: { type: "string", format: "date-time" },
-            expiresAt: {
-              type: ["string", "null"],
-              format: "date-time",
-              description: "On-chain expires_at; null when this deployment disables expiry.",
-            },
-          },
-        },
-        { type: "null" },
-      ],
-      description: "Present only for a CLEAN verdict that was signed + confirmed; null when held.",
-    },
-    policyHash: {
-      type: "string",
-      pattern: "^[0-9a-f]{64}$",
-      description: "sha256 of GET /v1/policy bytes — the on-chain policy_hash committed to.",
-    },
-    retrievable: {
-      type: "boolean",
-      enum: [true],
-      description:
-        "Present only on attested results: a retrievable copy of the exact spec content " +
-        "was verified (or pinned) before the attestation was recorded.",
-    },
-    pinned: {
-      type: "boolean",
-      description:
-        "Present only on attested results: true when this service published the spec to " +
-        "the public job-spec registry itself.",
-    },
-    specRegistryUri: {
-      type: "string",
-      description: "Present only on attested results: https URL where the spec is retrievable.",
-    },
-  },
-} as const;
-
-const specNotRetrievableDescription =
-  "SPEC_NOT_RETRIEVABLE (code, retryable): no retrievable copy of the spec exists at the " +
-  "public registry or an https specUri, and the service could not pin it. Host the spec, " +
-  "then retry — attestations are never recorded for content workers cannot fetch.";
-
-const errorShape = {
-  type: "object",
-  required: ["ok", "error"],
-  properties: {
-    ok: { type: "boolean", enum: [false] },
-    error: { type: "string" },
-    code: { type: "string", description: "Machine-readable code (e.g. SPEC_NOT_RETRIEVABLE)." },
-    retryable: { type: "boolean" },
-    retryAfterSeconds: { type: "integer" },
-  },
-} as const;
-
-export function openApiDocument(): Record<string, unknown> {
-  return {
-    openapi: "3.1.0",
-    info: {
-      title: "AgenC Public Moderation API",
-      version: SERVICE_VERSION,
-      description:
-        "Publicly callable moderation attestation for the AgenC marketplace protocol. " +
-        "Scans job-spec payloads by the published deterministic policy and, on a clean " +
-        "verdict, records the on-chain ListingModeration/TaskModeration attestation the " +
-        "publish/hire gates consume. Not kit-entitlement gated. Source: " +
-        `github.com/tetsuo-ai/${SERVICE_NAME}.`,
-      license: { name: "MIT" },
-    },
-    paths: {
-      "/v1/moderation/listings": {
-        post: {
-          summary: "Moderate + attest a service listing",
-          description:
-            "Reads the on-chain ServiceListing spec_hash, resolves the payload (inline spec " +
-            "> specUri > on-chain spec_uri), fail-closed hash-matches it, scans, and on a " +
-            "clean verdict records record_listing_moderation. An attestation is only " +
-            "recorded after spec retrievability is established (registry, https URI, or a " +
-            "service-side pin).",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["listing"],
-                  properties: {
-                    listing: { type: "string", description: "ServiceListing PDA (base58)." },
-                    spec: { type: "object", description: "Inline job-spec envelope or payload." },
-                    specUri: { type: "string", description: "https URL of the hosted spec." },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
-            "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
-            "404": { description: "Listing not found on-chain.", content: { "application/json": { schema: errorShape } } },
-            "409": { description: specNotRetrievableDescription, content: { "application/json": { schema: errorShape } } },
-            "422": { description: "Spec does not hash to the on-chain spec_hash.", content: { "application/json": { schema: errorShape } } },
-            "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
-            "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
-          },
-        },
-      },
-      "/v1/moderation/tasks": {
-        post: {
-          summary: "Moderate + attest a task job spec (pre-pin or post-pin)",
-          description:
-            "PRE-PIN (external marketplaces): provide jobSpecHash plus the spec inline or by " +
-            "URI; the TaskModeration record is created for the hash you will pin via " +
-            "set_task_job_spec. For revision-5 listing hires, this must equal the immutable " +
-            "task-specific commitment funded by hire_from_listing; legacy uncommitted hires " +
-            "must be cancelled and re-hired. POST-PIN: omit them and the pinned TaskJobSpec is read " +
-            "from chain. Every attestation implies retrievable content: before recording, " +
-            "the service verifies the spec is fetchable at the public job-spec registry or " +
-            "an https specUri, or pins the inline payload to the registry itself; otherwise " +
-            "it refuses with SPEC_NOT_RETRIEVABLE (409, retryable).",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["task"],
-                  properties: {
-                    task: { type: "string", description: "Task PDA (base58)." },
-                    jobSpecHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
-                    spec: { type: "object" },
-                    specUri: { type: "string" },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
-            "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
-            "404": { description: "Task not found on-chain.", content: { "application/json": { schema: errorShape } } },
-            "409": {
-              description: `No job spec pinned and none provided; or ${specNotRetrievableDescription}`,
-              content: { "application/json": { schema: errorShape } },
-            },
-            "422": { description: "Spec does not hash to the expected job_spec_hash.", content: { "application/json": { schema: errorShape } } },
-            "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
-            "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
-          },
-        },
-      },
-      "/api/task-moderation/attest": {
-        post: {
-          summary: "Compatibility task attest (store-core / kit-backend request shape)",
-          description:
-            "Drop-in endpoint for callers of the hosted kit backend's attest route: accepts " +
-            "{ taskPda, jobSpecHash, jobSpec | text, ... } and responds with " +
-            "{ attested, moderation, txSignature }. No kit entitlement headers required.",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  required: ["taskPda", "jobSpecHash"],
-                  properties: {
-                    taskPda: { type: "string" },
-                    jobSpecHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
-                    jobSpec: { type: "object" },
-                    jobSpecUri: {
-                      type: "string",
-                      description:
-                        "https URL hosting the spec — feeds the retrievability gate " +
-                        "(the inline jobSpec/text still defines what gets scanned).",
-                    },
-                    jobSpecCanonicalJson: { type: "string" },
-                    text: { type: "string" },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            "200": {
-              description: "Kit-backend-shaped result.",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    required: ["ok", "attested", "moderation", "txSignature"],
-                    properties: {
-                      ok: { type: "boolean" },
-                      attested: { type: "boolean" },
-                      moderation: { type: "object" },
-                      txSignature: { type: ["string", "null"] },
-                      retrievable: {
-                        type: "boolean",
-                        enum: [true],
-                        description: "Present only when attested — see /v1/moderation/tasks.",
-                      },
-                      pinned: { type: "boolean", description: "Present only when attested." },
-                      specRegistryUri: { type: "string", description: "Present only when attested." },
-                    },
-                  },
-                },
-              },
-            },
-            "4XX": { description: "Rejections (same statuses as /v1/moderation/tasks).", content: { "application/json": { schema: errorShape } } },
-          },
-        },
-      },
-      "/v1/policy": {
-        get: {
-          summary: "The exact policy document bytes (sha256 == on-chain policy_hash)",
-          responses: { "200": { description: "Markdown.", content: { "text/markdown": {} } } },
-        },
-      },
-      "/v1/info": {
-        get: {
-          summary: "Service identity: signer pubkey, cluster, policy/scanner hashes, TTL",
-          responses: { "200": { description: "Info.", content: { "application/json": {} } } },
-        },
-      },
-      "/v1/health": {
-        get: { summary: "Liveness", responses: { "200": { description: "OK." } } },
-      },
-    },
-    components: {
-      securitySchemes: {
-        bearerKey: {
-          type: "http",
-          scheme: "bearer",
-          description:
-            "Only enforced when the deployment configures ATTEST_API_KEYS; the public " +
-            "hosted deployment is open + rate-limited.",
-        },
-      },
-    },
-  };
+import { SERVICE_NAME, SERVICE_VERSION } from './version.js';
+const hash = {type:'string',pattern:'^[0-9a-f]{64}$'};
+const pda = {type:'string',pattern:'^[1-9A-HJ-NP-Za-km-z]{32,44}$'};
+const signature = {type:'string',pattern:'^[0-9a-f]{128}$'};
+const signedDocument = {type:'object',required:['body','signature'],properties:{body:{type:'object'},signature}};
+const lamports={type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER};
+const paymentBinding={type:'object',additionalProperties:false,required:['recordPda','priceLamports','payer'],properties:{recordPda:pda,priceLamports:lamports,payer:pda}};
+const paymentOffer={type:'object',required:['transaction','lastValidBlockHeight','priceLamports','rentLamports','serviceFeeLamports','recordPda','moderator'],properties:{
+ transaction:{type:'string',contentEncoding:'base64',description:'Version-0 Solana wire transaction signed by R only; creator adds its signature and submits. Exactly creator-to-R SystemProgram transfer, then record_task_moderation; no compute-budget instructions.'},
+ lastValidBlockHeight:{type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER},priceLamports:lamports,rentLamports:lamports,serviceFeeLamports:lamports,recordPda:pda,moderator:pda,
+}};
+const intakeDocument={...signedDocument,properties:{...signedDocument.properties,body:{type:'object',required:['payment','record'],properties:{
+ payment:{oneOf:[paymentBinding,{type:'null'}]},record:{type:'object',required:['moderator','pda','txSignature'],properties:{moderator:{type:['string','null']},pda:{type:['string','null']},txSignature:{type:['string','null']}}},
+}}}};
+const creatorAuthorization = {type:'object',required:['issuedAt','nonce','signature'],properties:{issuedAt:{type:'string',format:'date-time'},nonce:{type:'string',pattern:'^[0-9a-f]{32,128}$'},signature}};
+const request = {type:'object',required:['task'],properties:{task:pda,taskPda:pda,jobSpecHash:hash,spec:{type:'object'},specUri:{type:'string',format:'uri'},preflightOnly:{type:'boolean'},creatorAuthorization}};
+const compatRequest = {...request,required:['jobSpecHash'],properties:{...request.properties,jobSpec:{type:'object'},jobSpecUri:{type:'string'},text:{type:'string'},jobSpecCanonicalJson:{type:'string'}}};
+const pending = {type:'object',required:['ok','moderator','pending','jobId','retryAfterSeconds'],properties:{ok:{const:true},moderator:{type:['string','null']},pending:{const:true},jobId:{type:'string',format:'uuid'},retryAfterSeconds:{type:'integer',const:5},attested:{const:false},attestation:{type:['object','null']}}};
+const result = {type:'object',dependentRequired:{transaction:paymentOffer.required.filter(k=>k!=='transaction')},required:['moderator'],properties:{...paymentOffer.properties,ok:{const:true},moderator:{type:['string','null']},attested:{type:'boolean'},verdict:{type:'string',enum:['clean','suspicious','blocked']},riskScore:{type:'number'},specHash:hash,policyHash:hash,signedVerdict:intakeDocument,attestation:{type:['object','null'],properties:{signature:{type:'string'},recordedAt:{type:'string',format:'date-time'},expiresAt:{type:['string','null'],format:'date-time'}}},pending:{type:'boolean'},jobId:{type:'string',format:'uuid'},retryAfterSeconds:{type:'integer'},preflightOnly:{type:'boolean'},wouldAttest:{type:'boolean'},moderation:{type:'object'},txSignature:{type:['string','null']}}};
+const deliverableResult = {type:'object',required:['ok','moderator','attested','verdict','attestation','signedVerdict'],properties:{ok:{const:true},moderator:{type:['string','null']},attested:{const:false},attestation:{type:'null'},verdict:result.properties.verdict,signedVerdict:signedDocument}};
+const error = {type:'object',required:['ok','moderator','error','logId'],properties:{ok:{const:false},moderator:{type:'null'},error:{const:'Request could not be completed.'},logId:{type:'string',format:'uuid'},retryAfterSeconds:{type:'integer'},retryable:{type:'boolean'},code:{type:'string'}}};
+const content=(schema:unknown)=>({'application/json':{schema}});
+const response=(description:string,schema:unknown=result)=>({description,content:content(schema)});
+const errors={
+ '400':response('Malformed request or JSON depth limit',error),'401':response('Configured Desktop bearer API key required',error),
+ '403':response('Creator binding or worker authentication refused',error),'404':response('Task/submission missing or stored result unavailable',error),
+ '409':response('Task/hash/submission/lease conflict, expired review, changed policy or spec not retrievable',error),
+ '413':response('Body exceeds 512 KiB',error),'422':response('Spec hash mismatch or invalid repository spec',error),
+ '429':response('IP/creator quota or outstanding creator payment cap exceeded',error),
+ '502':response('Upstream read, independent worker recheck or chain failure; retryable after reconciliation',error),
+ '503':response('R/V/worker configuration, keys, roster or payment configuration unavailable',error),
+};
+const getLimited=response('GET per-IP or global rate exceeded; includes retryAfterSeconds and Retry-After',error);
+const intake={summary:'Creator-bound task intake; custom.github enqueues repository screening',requestBody:{required:true,content:content(request)},responses:{
+ '200':response('V-signed clean/hold/reject verdict, or unsigned preflight. CLEAN returns a creator-paid R-partially-signed payment offer. Creator co-signs and submits. If already paid, record.txSignature is present and transaction is absent. Repeat POST reissues only after blockhash expiry with the same signed verdict and price.'),
+ '202':response('Repository scan pending: pending:true, jobId, retryAfterSeconds:5. Repeat POST after the worker report is accepted to obtain the verdict and payment offer.',{oneOf:[pending,result]}),...errors}};
+const queueEnvelope={type:'object',required:['body','signature'],properties:{signature,body:{type:'object',required:['workerId','path','issuedAt','nonce','payload'],properties:{workerId:{type:'string'},path:{type:'string',enum:['/internal/worker/pull','/internal/worker/reports']},issuedAt:{type:'string',format:'date-time'},nonce:{type:'string',pattern:'^[0-9a-f]{32}$'},payload:{type:'object'}}}}};
+const params=(names:string[])=>names.map(name=>({in:'path',name,required:true,schema:name==='hash'||name==='artifact'?hash:pda}));
+export function openApiDocument() {
+ return {openapi:'3.1.0',info:{title:SERVICE_NAME,version:SERVICE_VERSION},components:{schemas:{PaymentBinding:paymentBinding,PaymentOffer:paymentOffer,IntakeVerdict:intakeDocument,PendingJob:pending,IntakeResult:result,DeliverableResult:deliverableResult,Error:error,WorkerEnvelope:queueEnvelope}},paths:{
+  '/v1/moderation/tasks':{post:intake},
+  '/api/task-moderation/attest':{post:{...intake,requestBody:{required:true,content:content(compatRequest)}}},
+  '/v1/moderation/deliverables':{post:{summary:'Review a submitted artifact; proofHash must equal artifactSha256',requestBody:{required:true,content:content({type:'object',required:['task','submissionPda','artifactSha256'],properties:{task:pda,submissionPda:pda,artifactSha256:hash}})},responses:{'200':response('Stored V-signed deliverable-review verdict; no chain transaction',deliverableResult),'202':response('Queued review',pending),...errors}}},
+  '/v1/attestations/{task}/{hash}':{get:{parameters:params(['task','hash']),responses:{'200':response('Stored unexpired intake verdict; reconciles confirmed payment via RPC history and returns signed record.txSignature without a transaction. Unpaid offers may be returned but GET never reissues. One chain read per attestation is reused for 5 seconds. Includes hold/reject reasons'),'404':response('Pending, unavailable or expired',error),'429':getLimited}}},
+  '/v1/deliverable-reviews/{task}/{submission}/{artifact}':{get:{parameters:params(['task','submission','artifact']),responses:{'200':response('Stored unexpired deliverable verdict',deliverableResult),'404':response('Pending, unavailable or expired',error),'429':getLimited}}},
+  '/internal/worker/pull':{post:{summary:'Worker-only signed queue request; restrict ingress to scanner droplet',description:'Sign the entire body with the report credential and agenc-worker-queue/v1 domain. Fresh 60-second request, durable nonce. payload:{}; path:/internal/worker/pull. Does not use Desktop bearer keys.',requestBody:{required:true,content:content(queueEnvelope)},responses:{'200':response('15-minute lease',{type:'object',required:['moderator','jobId','leaseToken','leaseExpiresAt','job'],properties:{moderator:{type:'null'},jobId:{type:'string',format:'uuid'},leaseToken:{type:'string',pattern:'^[0-9a-f]{48}$'},leaseExpiresAt:{type:'string',format:'date-time'},job:{type:'object'}}}),'204':{description:'No available jobs; empty body'},'403':errors['403'],'409':response('Request nonce replay',error),'503':errors['503']}}},
+  '/internal/worker/reports':{post:{summary:'Worker-only report acknowledgement after durable signer recheck',description:'Queue envelope payload:{jobId,leaseToken,report:{body,signature}}. Report uses agenc-worker-report/v1. Retry exact report under a fresh transport nonce. Clean intake finalization failures remain durable and resume through Desktop POST.',requestBody:{required:true,content:content(queueEnvelope)},responses:{'200':response('Report durably accepted',{type:'object',required:['moderator','accepted','jobId'],properties:{moderator:{type:'null'},accepted:{const:true},jobId:{type:'string',format:'uuid'}}}),...errors}}},
+  '/v1/keys':{get:{responses:{'200':response('Offline-root signed key manifest',{type:'object',required:['ok','moderator','manifest'],properties:{ok:{const:true},moderator:{type:'null'},manifest:signedDocument}}),'429':getLimited,'502':errors['502']}}},
+  '/v1/policy':{get:{responses:{'200':{description:'Exact policy bytes',content:{'text/markdown':{schema:{type:'string'}}}}}}},
+  '/v1/info':{get:{responses:{'200':response('Public configuration; repository.scannerHash commits to worker bundle/image'),'429':getLimited}}},
+  '/v1/health':{get:{responses:{'200':response('Liveness')}}},
+ }};
 }

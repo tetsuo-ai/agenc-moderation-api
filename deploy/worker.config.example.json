@@ -1,0 +1,8 @@
+{
+  "queueUrl": "https://attestor.example.com",
+  "workerId": "scanner-do-1",
+  "cli": "podman",
+  "image": "ghcr.io/YOUR_ORG/agenc-scanner@sha256:REPLACE_WITH_64_HEX_DIGEST",
+  "restrictedNetwork": "agenc-fetch",
+  "artifactRegistryUrl": "https://YOUR_APPROVED_ARTIFACT_REGISTRY"
+}

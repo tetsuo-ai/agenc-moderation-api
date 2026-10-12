@@ -1,0 +1,39 @@
+#!/usr/sbin/nft -f
+# TEMPLATE. Replace UID and populate address sets from the approved DNS names
+# before enabling. Empty sets fail closed. Reconcile DNS TTLs atomically.
+# Never flush the machine's existing ruleset. This table constrains only the
+# dedicated worker user and its rootless network helper traffic, including DO
+# metadata/private ranges. SSH and other OS users retain their existing rules.
+define worker_uid = 1002
+table inet agenc_worker_egress {
+  set github_v4 { type ipv4_addr; flags timeout; }
+  set github_v6 { type ipv6_addr; flags timeout; }
+  set osv_v4 { type ipv4_addr; flags timeout; }
+  set osv_v6 { type ipv6_addr; flags timeout; }
+  set registry_v4 { type ipv4_addr; flags timeout; }
+  set registry_v6 { type ipv6_addr; flags timeout; }
+  set artifact_v4 { type ipv4_addr; flags timeout; }
+  set artifact_v6 { type ipv6_addr; flags timeout; }
+  set signer_v4 { type ipv4_addr; flags timeout; }
+  set signer_v6 { type ipv6_addr; flags timeout; }
+  chain output {
+    type filter hook output priority -10; policy accept;
+    meta skuid != $worker_uid return
+    # Local resolver only; no arbitrary outbound DNS to tunnels.
+    ip daddr 127.0.0.53 udp dport 53 accept
+    ip daddr 127.0.0.53 tcp dport 53 accept
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } reject
+    ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } reject
+    ip daddr @github_v4 tcp dport 443 accept
+    ip6 daddr @github_v6 tcp dport 443 accept
+    ip daddr @osv_v4 tcp dport 443 accept
+    ip6 daddr @osv_v6 tcp dport 443 accept
+    ip daddr @registry_v4 tcp dport 443 accept
+    ip6 daddr @registry_v6 tcp dport 443 accept
+    ip daddr @artifact_v4 tcp dport 443 accept
+    ip6 daddr @artifact_v6 tcp dport 443 accept
+    ip daddr @signer_v4 tcp dport 443 accept
+    ip6 daddr @signer_v6 tcp dport 443 accept
+    reject
+  }
+}

@@ -1,7 +1,7 @@
 {
   "name": "@tetsuo-ai/agenc-moderation-api",
   "version": "0.2.1",
-  "description": "Publicly callable + self-hostable moderation attestation service for the AgenC marketplace protocol — deterministic policy scan, fail-closed spec-hash binding, on-chain ListingModeration/TaskModeration recording (global authority or roster attestor).",
+  "description": "AgenC Desktop phase 1 attestor: creator-paid task intake, durable creator quotas and domain-separated Ed25519 verdicts for revision 5.",
   "packageManager": "npm@11.7.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,17 +19,20 @@
   "files": [
     "dist",
     "src",
-    "api",
-    "vercel.json",
     "Dockerfile",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "deploy",
+    "worker",
+    "tsconfig.json",
+    "tsup.config.ts"
   ],
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "start": "node dist/bin.js",
+    "worker": "node dist/worker.js",
     "dev": "npm run build && node dist/bin.js"
   },
   "dependencies": {
@@ -39,6 +42,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "litesvm": "1.1.0",
     "tsup": "8.5.1",
     "typescript": "5.9.3",
     "vitest": "4.1.8"
