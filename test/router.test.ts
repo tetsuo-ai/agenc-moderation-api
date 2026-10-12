@@ -272,6 +272,15 @@ describe("gates", () => {
     expect(body.logId).toEqual(expect.any(String));
   });
 
+  it("counts an IPv6 /64 as one client, so one host cannot spend the global budget alone", async () => {
+    process.env.TRUST_PROXY = "1";
+    const handler = createModerationApi({ rateLimitGetPerIp: 1, rateLimitGetGlobal: 10, rateLimitWindowMs: 60_000 });
+    const get = (ip: string) => handler(new Request(`${BASE}/v1/info`, { headers: { "x-forwarded-for": ip } }));
+    expect((await get("2001:db8:1:2::1")).status).toBe(200);
+    expect((await get("2001:db8:1:2:ffff::9")).status).toBe(429);
+    expect((await get("2001:db8:1:3::1")).status).toBe(200);
+  });
+
   it("rate limits GET reads per IP and globally, on a budget separate from POST", async () => {
     process.env.TRUST_PROXY = "1";
     const handler = createModerationApi({ rateLimitPerIp: 1, rateLimitGetPerIp: 2, rateLimitGetGlobal: 3, rateLimitWindowMs: 60_000 });
@@ -286,9 +295,10 @@ describe("gates", () => {
     // A different IP is bounded by the GLOBAL GET ceiling.
     expect((await get("198.51.100.9")).status).toBe(404);
     expect((await get("198.51.100.10")).status).toBe(429);
-    // Liveness and static documents stay open.
+    // Liveness, static documents and the key list every client needs stay open.
     expect((await get("203.0.113.7", "/v1/health")).status).toBe(200);
     expect((await get("203.0.113.7", "/v1/policy")).status).toBe(200);
+    expect((await get("203.0.113.7", "/v1/keys")).status).not.toBe(429);
     // Reads did not spend the POST budget.
     const posted = await handler(
       await post(

@@ -81,10 +81,8 @@ describe("registry URL construction", () => {
 });
 
 describe("ensureSpecRetrievable", () => {
-  it("short-circuits with ZERO network when the payload was resolved from a URI", async () => {
-    const { impl, calls } = fetchStub(() => {
-      throw new Error("network must not be touched");
-    });
+  it("uses the URI the payload was resolved from when the registry does not hold it", async () => {
+    const { impl, calls } = fetchStub(() => new Response("{}", { status: 404 }));
     const result = await ensureSpecRetrievable(
       {
         registryUrl: REGISTRY,
@@ -105,7 +103,36 @@ describe("ensureSpecRetrievable", () => {
       pinned: false,
       specRegistryUri: "https://specs.example/spec.json",
     });
-    expect(calls).toHaveLength(0);
+    // Only the registry was asked; the resolved URI needed no second fetch.
+    expect(calls).toHaveLength(1);
+  });
+
+  it("signs the registry's address for a spec it holds, even when the payload came from another URI", async () => {
+    const target = await canonicalHex(PAYLOAD);
+    const envelope = {
+      schemaVersion: 1,
+      kind: "agenc.marketplace.jobSpecEnvelope",
+      integrity: { algorithm: "sha256", canonicalization: "json-stable-v1", payloadHash: target, uri: `${REGISTRY}/api/job-specs/${target}` },
+      payload: PAYLOAD,
+    };
+    const { impl } = fetchStub((method, url) =>
+      method === "GET" && url === `${REGISTRY}/api/job-specs/${target}` ? jsonResponse(envelope) : jsonResponse({ ok: false }, 500),
+    );
+    const result = await ensureSpecRetrievable(
+      {
+        registryUrl: REGISTRY,
+        registryToken: null,
+        targetHashHex: target,
+        payload: PAYLOAD,
+        // Whoever opened the intake named their own mirror of the same bytes.
+        resolvedFromUri: "https://mirror.attacker.example/spec.json",
+        candidateUris: ["https://mirror.attacker.example/spec.json"],
+        moderator: null,
+        what: "task spec",
+      },
+      { fetchImpl: impl, fetchSpecBody: () => Promise.reject(new Error("must not fetch")) },
+    );
+    expect(result.specRegistryUri).toBe(`${REGISTRY}/api/job-specs/${target}`);
   });
 
   it("accepts a registry object whose canonical payload hash matches", async () => {

@@ -181,6 +181,24 @@ export function clientIp(request: Request): string {
   return socketIp(request) ?? 'unknown';
 }
 
+/**
+ * The key a client is counted under. One host usually holds a whole IPv6 /64,
+ * so counting each address apart would let it spend the global budget alone:
+ * IPv6 is counted per /64. IPv4 (also IPv4-mapped IPv6) stays per address.
+ */
+export function rateKey(ip: string): string {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return mapped[1]!;
+  if (!ip.includes(':')) return ip;
+  const [head = '', tail = ''] = ip.split('%')[0]!.toLowerCase().split('::');
+  const left = head ? head.split(':') : [];
+  const right = tail ? tail.split(':') : [];
+  if (left.length + right.length > 8 || [...left, ...right].some(part => !/^[0-9a-f]{1,4}$/.test(part))) return ip;
+  const groups = ip.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
+  if (groups.length !== 8) return ip;
+  return `${groups.slice(0, 4).map(part => part.replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
 /** Test hook. */
 export function __resetRateLimiterForTests(): void {
   localWindows.clear();

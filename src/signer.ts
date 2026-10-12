@@ -426,8 +426,10 @@ export async function attestTask(deps: AttestDeps, params: {
     ? (task.data.status === 0 && task.data.currentWorkers === 0 && task.data.completions === 0 ? true : (()=>{throw new ModerationRejectError(409,'Task changed.');})())
     : bindRequester(task.data,params.task,target,params.creatorAuthorization,store,params.preflightOnly);
   if(existing && (existing.expires > Date.now() || ['queued','reserved','pending'].includes(existing.state)) && existing.hash !== target) throw new ModerationRejectError(409,'One live hash per task.');
-  // The request that opened this intake fixed its spec URI. A later request cannot swap in its own.
-  if(queuedContext && params.specUri !== undefined && params.specUri !== queuedContext.specUri) throw new ModerationRejectError(409,'Spec URI already bound.');
+  // The request that opened this intake fixed its spec URI: a later request cannot swap in its own.
+  // It is not refused for naming another either, because anyone may open the intake first (the
+  // description commitment binds the hash, not the URI). A spec the registry holds is signed with
+  // the registry's address for its hash, whatever URI anyone named (see ensureSpecRetrievable).
   const specUri = queuedContext ? queuedContext.specUri : params.specUri;
   if(!params.preflightOnly) store.rememberBinding(params.task,target,{payload:params.spec ?? {},creator:task.data.creator,authenticatedCreator,creatorAuthorization:params.creatorAuthorization ?? queuedContext?.creatorAuthorization,specUri});
   const resolved = await resolveSpecAgainstHash({targetHashHex:target,spec:params.spec,specUri:specUri ?? (pinned.exists ? pinned.data.jobSpecUri : undefined),rawText:params.rawText,what:'task spec'});

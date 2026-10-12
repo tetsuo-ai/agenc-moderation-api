@@ -280,15 +280,10 @@ export async function ensureSpecRetrievable(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const fetchSpec = deps.fetchSpecBody ?? fetchJobSpecBody;
 
-  // Proven by construction: the payload was just fetched from this URI and
-  // fail-closed hash-matched by the attest core.
-  if (params.resolvedFromUri) {
-    return { retrievable: true, pinned: false, specRegistryUri: params.resolvedFromUri };
-  }
-
   const failures: string[] = [];
 
-  // 1. Already retrievable at the registry.
+  // 1. Already retrievable at the registry. The registry's address depends only on the hash, so it
+  //    comes first: no requester can get another URI signed for a spec the registry holds.
   const objectUrl = jobSpecRegistryObjectUrl(params.registryUrl, target);
   try {
     const response = await fetchImpl(objectUrl, {
@@ -307,6 +302,12 @@ export async function ensureSpecRetrievable(
     }
   } catch {
     failures.push("registry GET failed");
+  }
+
+  // Proven by construction: the payload was just fetched from this URI and
+  // fail-closed hash-matched by the attest core.
+  if (params.resolvedFromUri) {
+    return { retrievable: true, pinned: false, specRegistryUri: params.resolvedFromUri };
   }
 
   // 2. Retrievable at the caller's (or on-chain) https URI — untrusted input,

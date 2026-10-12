@@ -11,7 +11,7 @@ import type { CreatorAuthorization } from './binding.js';
 
 import { normalizeTaskModerationInput } from "@tetsuo-ai/marketplace-moderation";
 import { loadConfig, type ServiceConfig } from "./config.js";
-import { clientIp, limiterMode, rateLimit, type RateScope } from "./rate-limit.js";
+import { clientIp, limiterMode, rateKey, rateLimit, type RateScope } from "./rate-limit.js";
 import { MAX_BODY_BYTES } from "./limits.js";
 import {
   attestTask,
@@ -104,7 +104,7 @@ function attestErrorResponse(error: unknown, config: ServiceConfig): Response {
 
 /** Rate gate for one scope. Returns a 429 to short-circuit, or null to proceed. */
 async function gateRate(config: ServiceConfig, request: Request, scope: RateScope): Promise<Response | null> {
-  const decision = await rateLimit(config, clientIp(request), scope);
+  const decision = await rateLimit(config, rateKey(clientIp(request)), scope);
   if (decision.allowed) return null;
   const response = errorJson(429,'Request rate exceeded.',{retryAfterSeconds:decision.retryAfterSeconds});
   response.headers.set('retry-after',String(decision.retryAfterSeconds));
@@ -349,10 +349,11 @@ export function createModerationApi(configOverride?: Partial<ServiceConfig>, ove
           });
         }
         if (path === "/openapi.json") return json(openApiDocument());
-        // Everything below reads files, the store or the RPC, so it is rate limited.
+        // The key list is one small file every client needs to check a verdict: never rate limited.
+        if (path === '/v1/keys') return json({ok:true,manifest:loadKeyManifest()});
+        // Everything below reads the store or the RPC, or hashes the scanner bundle, so it is rate limited.
         const gate = await gateRate(config, request, 'get');
         if (gate) return gate;
-        if (path === '/v1/keys') return json({ok:true,manifest:loadKeyManifest()});
         const match = /^\/v1\/attestations\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
         if(match) {
           const result=await getStoredAttestation({...attestDeps(config),...overrides},match[1],match[2]);

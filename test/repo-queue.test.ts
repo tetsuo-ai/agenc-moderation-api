@@ -280,14 +280,21 @@ it('finalizes with the spec URI of the request that opened the intake',async()=>
  const l=await lease(),r=await processJob(l.job,worker);
  vi.stubGlobal('fetch',vi.fn(async()=>new Response('{}',{status:404})));
  expect((await review(l,r)).status).toBe(200);expect((await get()).status).toBe(404);
- // Anyone may POST for a committed hash, but not with their own copy of the spec.
+ // Anyone may POST for a committed hash. A different URI is neither refused nor used: it cannot finalize with it.
  state.hosted=[OTHER_URI];
- expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:OTHER_URI})).status).toBe(409);
+ expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:OTHER_URI})).status).not.toBe(200);
  expect((await get()).status).toBe(404);
  // A retry without a URI resumes with the URI bound at enqueue.
  state.hosted=[CREATOR_URI];
  const done=await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD});expect(done.status).toBe(200);
  expect((await done.json()).signedVerdict.body.jobSpecUri).toBe(CREATOR_URI);expect(state.events).toEqual([]);expect(spend().n).toBe(0);
+});
+it('does not lock the creator out when a third party opens the intake first with its own URI',async()=>{
+ const CREATOR_URI='https://mock.test/creator-spec',OTHER_URI='https://mock.test/other-spec';
+ state.hosted=[OTHER_URI,CREATOR_URI];
+ expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:OTHER_URI})).status).toBe(202);
+ const creator=await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:CREATOR_URI});
+ expect(creator.status).not.toBe(409);expect([200,202]).toContain(creator.status);
 });
 it('returns a receipt without a payment offer when reusing an existing valid chain record',async()=>{
  await intake();state.record=record();await runDevelopmentWorkerOnce(deps,worker);

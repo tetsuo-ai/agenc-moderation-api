@@ -109,3 +109,17 @@ it('trusts proxy header only when explicitly enabled',()=>{
   process.env.TRUST_PROXY='1';
   try { expect(clientIp(new Request('http://svc.test',{headers:{'x-forwarded-for':'fake, 70.0.0.1'}}))).toBe('70.0.0.1'); } finally {delete process.env.TRUST_PROXY;}
 });
+
+describe("rateKey", () => {
+  it("keeps IPv4 per address and groups IPv6 by /64", async () => {
+    const { rateKey } = await import("../src/rate-limit.js");
+    expect(rateKey("203.0.113.7")).toBe("203.0.113.7");
+    expect(rateKey("::ffff:203.0.113.7")).toBe("203.0.113.7");
+    expect(rateKey("2001:db8:1:2::1")).toBe("2001:db8:1:2::/64");
+    expect(rateKey("2001:0db8:0001:0002:aaaa:bbbb:cccc:dddd")).toBe("2001:db8:1:2::/64");
+    expect(rateKey("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(rateKey("fe80::1%en0")).toBe("fe80:0:0:0::/64");
+    expect(rateKey("unknown")).toBe("unknown");
+    expect(rateKey("2001:db8:zz::1")).toBe("2001:db8:zz::1");
+  });
+});
