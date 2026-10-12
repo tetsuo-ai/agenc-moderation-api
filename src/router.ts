@@ -11,7 +11,7 @@ import type { CreatorAuthorization } from './binding.js';
 
 import { normalizeTaskModerationInput } from "@tetsuo-ai/marketplace-moderation";
 import { loadConfig, type ServiceConfig } from "./config.js";
-import { clientIp, limiterMode, rateLimit } from "./rate-limit.js";
+import { clientIp, limiterMode, rateLimit, type RateScope } from "./rate-limit.js";
 import { MAX_BODY_BYTES } from "./limits.js";
 import {
   attestTask,
@@ -102,6 +102,15 @@ function attestErrorResponse(error: unknown, config: ServiceConfig): Response {
   return errorJson(status,'Request could not be completed.',{logId,...(error instanceof SpecNotRetrievableError ? {code:error.code,retryable:true} : {})});
 }
 
+/** Rate gate for one scope. Returns a 429 to short-circuit, or null to proceed. */
+async function gateRate(config: ServiceConfig, request: Request, scope: RateScope): Promise<Response | null> {
+  const decision = await rateLimit(config, clientIp(request), scope);
+  if (decision.allowed) return null;
+  const response = errorJson(429,'Request rate exceeded.',{retryAfterSeconds:decision.retryAfterSeconds});
+  response.headers.set('retry-after',String(decision.retryAfterSeconds));
+  return response;
+}
+
 /** POST gate: API key (when configured) then rate limit. Returns a Response to short-circuit, or null to proceed. */
 async function gatePost(config: ServiceConfig, request: Request): Promise<Response | null> {
   if (config.apiKeys.length > 0) {
@@ -111,13 +120,7 @@ async function gatePost(config: ServiceConfig, request: Request): Promise<Respon
       return errorJson(401, "This deployment requires an API key (Authorization: Bearer <key>).");
     }
   }
-  const decision = await rateLimit(config, clientIp(request));
-  if (!decision.allowed) {
-    const response = errorJson(429,'Request rate exceeded.',{retryAfterSeconds:decision.retryAfterSeconds});
-    response.headers.set('retry-after',String(decision.retryAfterSeconds));
-    return response;
-  }
-  return null;
+  return gateRate(config, request, 'post');
 }
 
 /* ------------------------------- handlers -------------------------------- */
@@ -301,6 +304,7 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
       perIp: config.rateLimitPerIp,
       global: config.rateLimitGlobal,
       windowMs: config.rateLimitWindowMs,
+      get: {perIp:config.rateLimitGetPerIp,global:config.rateLimitGetGlobal},
     },
     endpoints: [
       "GET /v1/keys",
@@ -335,6 +339,19 @@ export function createModerationApi(configOverride?: Partial<ServiceConfig>, ove
     try {
       if (request.method === "GET") {
         if (path === "/v1/health") return json({ ok: true });
+        if (path === "/v1/policy") {
+          return new Response(new Uint8Array(moderationPolicyBytes()), {
+            status: 200,
+            headers: {
+              "content-type": "text/markdown; charset=utf-8",
+              "cache-control": "public, max-age=300",
+            },
+          });
+        }
+        if (path === "/openapi.json") return json(openApiDocument());
+        // Everything below reads files, the store or the RPC, so it is rate limited.
+        const gate = await gateRate(config, request, 'get');
+        if (gate) return gate;
         if (path === '/v1/keys') return json({ok:true,manifest:loadKeyManifest()});
         const match = /^\/v1\/attestations\/([^/]+)\/([0-9a-f]{64})$/.exec(path);
         if(match) {
@@ -348,18 +365,7 @@ export function createModerationApi(configOverride?: Partial<ServiceConfig>, ove
           if(!stored?.result || stored.expires<=Date.now()) return errorJson(404,'Review unavailable.');
           return json({ok:true,attested:false,...JSON.parse(stored.result)});
         }
-        if (path === "/v1/info") return handleInfo(config);
-        if (path === "/v1/policy") {
-          return new Response(new Uint8Array(moderationPolicyBytes()), {
-            status: 200,
-            headers: {
-              "content-type": "text/markdown; charset=utf-8",
-              "cache-control": "public, max-age=300",
-            },
-          });
-        }
-        if (path === "/openapi.json") return json(openApiDocument());
-        if (path === "/" ) return handleInfo(config);
+        if (path === "/v1/info" || path === "/") return handleInfo(config);
         return errorJson(404, `Unknown path ${path}. See GET /v1/info for the endpoint list.`);
       }
 

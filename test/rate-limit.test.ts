@@ -50,6 +50,16 @@ describe("rate limiter (in-memory, no Upstash)", () => {
     expect(denied.deniedBy).toBe("ip");
   });
 
+  it("keeps GET counters and limits apart from POST", async () => {
+    const ip = "203.0.113.8";
+    const config = { ...BASE, rateLimitGetPerIp: 5, rateLimitGetGlobal: 100 };
+    for (let i = 0; i < 5; i++) expect((await rateLimit(config, ip, "get")).allowed).toBe(true);
+    const denied = await rateLimit(config, ip, "get");
+    expect(denied).toMatchObject({ allowed: false, deniedBy: "ip" });
+    // The POST budget for the same IP is untouched.
+    expect((await rateLimit(config, ip)).allowed).toBe(true);
+  });
+
   it("reports per-instance mode when no Upstash is configured", () => {
     expect(limiterMode(BASE)).toBe("per-instance");
   });

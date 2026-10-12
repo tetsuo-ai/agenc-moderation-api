@@ -271,6 +271,34 @@ describe("gates", () => {
     expect(body.error).toBe("Request could not be completed.");
     expect(body.logId).toEqual(expect.any(String));
   });
+
+  it("rate limits GET reads per IP and globally, on a budget separate from POST", async () => {
+    process.env.TRUST_PROXY = "1";
+    const handler = createModerationApi({ rateLimitPerIp: 1, rateLimitGetPerIp: 2, rateLimitGetGlobal: 3, rateLimitWindowMs: 60_000 });
+    const get = (ip: string, path = `/v1/attestations/9UEu2Gv9Q7DwBtumR2rUSq5g8v7b6mxn26ZNQCky82RJ/${"ab".repeat(32)}`) =>
+      handler(new Request(`${BASE}${path}`, { headers: { "x-forwarded-for": ip } }));
+    expect((await get("203.0.113.7")).status).toBe(404);
+    expect((await get("203.0.113.7", "/v1/info")).status).toBe(200);
+    const limited = await get("203.0.113.7");
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toMatch(/^\d+$/);
+    expect(await limited.json()).toMatchObject({ retryAfterSeconds: expect.any(Number) });
+    // A different IP is bounded by the GLOBAL GET ceiling.
+    expect((await get("198.51.100.9")).status).toBe(404);
+    expect((await get("198.51.100.10")).status).toBe(429);
+    // Liveness and static documents stay open.
+    expect((await get("203.0.113.7", "/v1/health")).status).toBe(200);
+    expect((await get("203.0.113.7", "/v1/policy")).status).toBe(200);
+    // Reads did not spend the POST budget.
+    const posted = await handler(
+      await post(
+        "/v1/moderation/tasks",
+        { task: "9UEu2Gv9Q7DwBtumR2rUSq5g8v7b6mxn26ZNQCky82RJ", spec: { t: "clean text" } },
+        { "x-forwarded-for": "203.0.113.7" },
+      ),
+    );
+    expect(posted.status).toBe(200);
+  });
 });
 
 describe("signer key parsing", () => {

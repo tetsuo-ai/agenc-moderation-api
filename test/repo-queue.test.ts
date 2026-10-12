@@ -1,6 +1,6 @@
 /** End-to-end HTTP + durable SQLite + real worker/signatures. Every RPC,
  * GitHub, registry and container boundary is mocked; no live transactions. */
-import { generateKeyPairSync, sign, verify } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign, verify } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
@@ -14,7 +14,7 @@ import { creatorRequestBytes } from '../src/binding.js';
 import { moderationPolicyHashBytes } from '../src/policy.js';
 import { scannerHash } from '../worker/rules.js';
 const state=vi.hoisted(()=>({creator:'',moderator:'',hash:'',status:0,workers:0,completions:0,pinned:false,
- record:null as any,height:1n,blockhashByte:7,lastValid:100n,balance:1_000_000_000n,events:[] as string[],timeout:false,subHash:'',subTask:'',subStatus:1,claimWorker:'agent'}));
+ record:null as any,height:1n,blockhashByte:7,lastValid:100n,balance:1_000_000_000n,events:[] as string[],timeout:false,subHash:'',subTask:'',subStatus:1,claimWorker:'agent',hosted:[] as string[]}));
 vi.mock('@solana/kit',async original=>({...await original<typeof import('@solana/kit')>(),createSolanaRpc:()=>({
  getGenesisHash:()=>({send:async()=> 'genesis-test'}),
  getLatestBlockhash:()=>({send:async()=>({value:{blockhash:base58Encode(new Uint8Array(32).fill(state.blockhashByte)),lastValidBlockHeight:state.lastValid}})}),
@@ -37,8 +37,15 @@ vi.mock('@tetsuo-ai/marketplace-sdk',async original=>({...await original<typeof 
  fetchMaybeTaskClaim:async()=>({exists:true,data:{task:TASK,worker:state.claimWorker}}),
  findTaskSubmissionPda:async()=>[SUBMISSION]
 }));
+// URIs under https://mock.test/ serve PAYLOAD only while listed in state.hosted.
+vi.mock('../src/ssrf-fetch.js',async original=>{const actual=await original<typeof import('../src/ssrf-fetch.js')>();return {...actual,fetchJobSpecBody:async(uri:string)=>{
+ if(!uri.startsWith('https://mock.test/')) return actual.fetchJobSpecBody(uri);
+ if(!state.hosted.includes(uri)) throw new actual.JobSpecCheckError('not hosted');
+ const bytesBuffer=Buffer.from(JSON.stringify(PAYLOAD));
+ return {text:bytesBuffer.toString('utf8'),bytesBuffer,bytes:bytesBuffer.length,contentType:'application/json',sha256:createHash('sha256').update(bytesBuffer).digest('hex')};
+}};});
 import { createModerationApi } from '../src/router.js';
-import { type AttestDeps } from '../src/signer.js';
+import { ATTESTATION_READ_CACHE_MS, type AttestDeps } from '../src/signer.js';
 import { RETRY_DELAYS_MS, runDevelopmentWorkerOnce } from '../src/repo-queue.js';
 import { __resetRateLimiterForTests } from '../src/rate-limit.js';
 import { processJob, type WorkerDeps } from '../worker/consumer.js';
@@ -89,7 +96,7 @@ beforeEach(async()=>{
  fixture=installVerdictFixture();payer=installPayerFixture();creator=creatorFixture();store=new AttestationStore(join(fixture.directory,'queue.sqlite'));
  Object.assign(state,{creator:creator.address,moderator:payer.address,hash:(await values.canonicalJobSpecHash(PAYLOAD)).hex,
   status:0,workers:0,completions:0,pinned:false,record:null,height:1n,blockhashByte:7,lastValid:100n,balance:1_000_000_000n,events:[],timeout:false,
-  subHash:hash(ARTIFACT_BYTES),subTask:TASK,subStatus:1,claimWorker:'agent'});
+  subHash:hash(ARTIFACT_BYTES),subTask:TASK,subStatus:1,claimWorker:'agent',hosted:[]});
  deps={rpcUrl:'https://rpc.test',attestationTtlSeconds:72*3600,store,repository:{imageDigest:DIGEST,workers:{'worker-1':keyAddress(W.privateKey)},github:github()}};
  box=sandbox();worker={workerId:'worker-1',reportKey:W.privateKey,imageDigest:DIGEST,github:github(),sandbox:()=>box,
   artifactBytes:async()=>ARTIFACT_BYTES,osv:async ds=>({results:ds.map(()=>({}))})};
@@ -174,7 +181,11 @@ it('persists queue and leases across restart and refuses an obsolete lease',asyn
 it('reconciles a creator-submitted transaction on GET without sending',async()=>{
  await intake();await runDevelopmentWorkerOnce(deps,worker);
  const offered=await (await intake()).json();expect(offered.transaction).toBeTruthy();expect((await get()).status).toBe(200);
- state.record=record();const paid=await (await get()).json();expect(paid.attested).toBe(true);expect(paid.transaction).toBeUndefined();expect(paid.signedVerdict.body.record.txSignature).toBeTruthy();expect(state.events).toEqual([]);expect(spend().n).toBe(0);
+ // GET reuses its chain read for a few seconds, so look again after that window.
+ const now=vi.spyOn(Date,'now').mockReturnValue(Date.now()+ATTESTATION_READ_CACHE_MS+1);
+ try {
+  state.record=record();const paid=await (await get()).json();expect(paid.attested).toBe(true);expect(paid.transaction).toBeUndefined();expect(paid.signedVerdict.body.record.txSignature).toBeTruthy();expect(state.events).toEqual([]);expect(spend().n).toBe(0);
+ } finally { now.mockRestore(); }
 });
 it.each(['quota','outstanding'])('enforces %s guard before admitting worker jobs',async guard=>{
  deps.spendLimits={...DEFAULT_SPEND_LIMITS,...(guard==='quota'?{dailyIntakes:0}:{outstandingTransactions:0})};
@@ -261,6 +272,22 @@ it('preserves a reviewed report when retrievability fails and resumes on Desktop
  expect((await review(l,r)).status).toBe(200);expect(store.job(l.jobId)?.state).toBe('reviewed');expect((await get()).status).toBe(404);expect(state.events).toEqual([]);
  vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify(PAYLOAD))));
  expect((await intake()).status).toBe(200);expect(state.events).toEqual([]);expect(spend().n).toBe(0);
+});
+it('finalizes with the spec URI of the request that opened the intake',async()=>{
+ const CREATOR_URI='https://mock.test/creator-spec',OTHER_URI='https://mock.test/other-spec';
+ expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:CREATOR_URI})).status).toBe(202);
+ // Finalization fails once: the registry and the creator URI both miss.
+ const l=await lease(),r=await processJob(l.job,worker);
+ vi.stubGlobal('fetch',vi.fn(async()=>new Response('{}',{status:404})));
+ expect((await review(l,r)).status).toBe(200);expect((await get()).status).toBe(404);
+ // Anyone may POST for a committed hash, but not with their own copy of the spec.
+ state.hosted=[OTHER_URI];
+ expect((await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD,specUri:OTHER_URI})).status).toBe(409);
+ expect((await get()).status).toBe(404);
+ // A retry without a URI resumes with the URI bound at enqueue.
+ state.hosted=[CREATOR_URI];
+ const done=await post('/v1/moderation/tasks',{task:TASK,jobSpecHash:state.hash,spec:PAYLOAD});expect(done.status).toBe(200);
+ expect((await done.json()).signedVerdict.body.jobSpecUri).toBe(CREATOR_URI);expect(state.events).toEqual([]);expect(spend().n).toBe(0);
 });
 it('returns a receipt without a payment offer when reusing an existing valid chain record',async()=>{
  await intake();state.record=record();await runDevelopmentWorkerOnce(deps,worker);

@@ -37,6 +37,10 @@ export interface ServiceConfig {
    * including payment transaction reissues.
    */
   rateLimitGlobal: number;
+  /** Per-IP requests per window for GET routes other than health, policy and the OpenAPI document. */
+  rateLimitGetPerIp: number;
+  /** GLOBAL GET ceiling per window, a bound on the RPC reads attestation GETs can cause. */
+  rateLimitGetGlobal: number;
   /** Rate-limit window in milliseconds. */
   rateLimitWindowMs: number;
   /** Optional Upstash REST binding for a cross-instance shared limiter. */
@@ -85,6 +89,8 @@ export function loadConfig(): ServiceConfig {
       .filter(Boolean),
     rateLimitPerIp: intEnv("RATE_LIMIT_PER_IP", 6, 1),
     rateLimitGlobal: intEnv("RATE_LIMIT_GLOBAL", 60, 1),
+    rateLimitGetPerIp: intEnv("RATE_LIMIT_GET_PER_IP", 60, 1),
+    rateLimitGetGlobal: intEnv("RATE_LIMIT_GET_GLOBAL", 600, 1),
     rateLimitWindowMs: intEnv("RATE_LIMIT_WINDOW_MS", 60_000, 1_000),
     upstashUrl: nonEmpty(process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL),
     upstashToken: nonEmpty(process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN),

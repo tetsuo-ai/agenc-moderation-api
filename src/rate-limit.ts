@@ -134,24 +134,31 @@ async function consume(
   };
 }
 
+/** POST spends the signer budget; GET has its own, higher budget for reads. */
+export type RateScope = "post" | "get";
+
 /**
  * Consume one request against BOTH the per-IP bound and the global ceiling.
  * Exceeding either denies; a configured-shared-store error also denies
  * (fail-closed) so the hot-key spend bound can't silently weaken.
  */
-export async function rateLimit(config: ServiceConfig, ip: string): Promise<RateDecision> {
-  const perIp = await consume(config, `ip:${ip}`);
+export async function rateLimit(config: ServiceConfig, ip: string, scope: RateScope = "post"): Promise<RateDecision> {
+  // Separate counters, so reads never use up the POST budget.
+  const prefix = scope === "get" ? "get:" : "";
+  const perIpLimit = scope === "get" ? config.rateLimitGetPerIp : config.rateLimitPerIp;
+  const globalLimit = scope === "get" ? config.rateLimitGetGlobal : config.rateLimitGlobal;
+  const perIp = await consume(config, `${prefix}ip:${ip}`);
   if (perIp === null) {
     return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
   }
-  if (perIp.count > config.rateLimitPerIp) {
+  if (perIp.count > perIpLimit) {
     return { allowed: false, retryAfterSeconds: perIp.retryAfterSeconds, deniedBy: "ip" };
   }
-  const global = await consume(config, "global");
+  const global = await consume(config, `${prefix}global`);
   if (global === null) {
     return { allowed: false, retryAfterSeconds: 2, deniedBy: "shared-store-error" };
   }
-  if (global.count > config.rateLimitGlobal) {
+  if (global.count > globalLimit) {
     return { allowed: false, retryAfterSeconds: global.retryAfterSeconds, deniedBy: "global" };
   }
   return { allowed: true, retryAfterSeconds: 0, deniedBy: null };

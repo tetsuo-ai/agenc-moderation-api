@@ -88,6 +88,8 @@ The signature is resolved from confirmed PDA history and verified against the
 actual record instruction. There is no `transaction` or `lastValidBlockHeight`
 once paid. A valid record that already exists also returns no payment offer.
 The RPC must provide confirmed transaction history for receipt lookup.
+GET reuses one chain read per stored attestation for five seconds, so a new
+payment can take up to five seconds to show.
 
 While a blockhash is live, repeat POST returns the identical stored offer.
 After blockheight expiry, repeat POST produces a fresh R-partially-signed
@@ -126,12 +128,15 @@ submission/artifact consumes creator scanner quota; retries consume none.
 Errors use `{ok:false,moderator:null,error:"Request could not be completed.",logId}`:
 **400** malformed input or JSON depth limit, **401** missing configured Desktop API key, **403**
 creator/worker authentication failure, **404** missing task/submission/result,
-**409** task/hash/submission/lease conflicts, changed policy or unavailable spec,
+**409** task/hash/submission/lease conflicts, changed policy, unavailable spec, or a
+`specUri` that differs from the one the intake was opened with,
 **413** body size limit, **422** hash mismatch or invalid GitHub spec, **429**
 IP/creator quota or outstanding-transaction cap, **502** upstream/recheck/chain failure, **503**
 unavailable R/V/worker/roster or invalid payment configuration. Spec retrievability errors also carry
 `code:"SPEC_NOT_RETRIEVABLE",retryable:true`. IP 429 includes `retryAfterSeconds`
-and a `Retry-After` header. See `/openapi.json` for request/response schemas.
+and a `Retry-After` header. GET routes other than health, policy and
+`/openapi.json` have their own limits: `RATE_LIMIT_GET_PER_IP` (default 60) and
+`RATE_LIMIT_GET_GLOBAL` (default 600) per window. See `/openapi.json` for request/response schemas.
 
 Listing writes return 410. POST responses have no CORS headers. Compat returns
 `moderation.status` and `verdict` as `clean`, `suspicious`, or `blocked`, and always
