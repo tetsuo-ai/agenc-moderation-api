@@ -28,18 +28,28 @@
  *    (`[..., task/listing, job_spec_hash, moderator]`) — consumers present
  *    THIS service's moderator pubkey at the consumption gates.
  *
- * THIS SERVICE SIGNS AND PAYS REAL TRANSACTIONS on whatever cluster RPC_URL
- * points at. The router's per-IP + global rate limits are the economic bound.
+ * WHO PAYS. The program makes the recording signer pay the deposit behind
+ * each new approval record, and that deposit is never returned. A caller that
+ * names a `payer` gets the approval back as a transaction signed by this
+ * service, in which the payer first hands this service's signer that deposit
+ * and is the fee payer; the payer signs and sends it, and this service spends
+ * nothing (see {@link RequesterPayment}). Without a `payer` THIS SERVICE SIGNS
+ * AND PAYS A REAL TRANSACTION on whatever cluster RPC_URL points at, unless
+ * the deployment requires a payer (`requesterPays`), in which case the request
+ * is refused. The router's per-IP + global rate limits bound the rest.
  */
 
 import { createHash } from "node:crypto";
 import {
+  AccountRole,
   address,
   appendTransactionMessageInstructions,
   createKeyPairSignerFromBytes,
+  createNoopSigner,
   createSolanaRpc,
   createTransactionMessage,
   getBase64EncodedWireTransaction,
+  partiallySignTransactionMessageWithSigners,
   pipe,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
@@ -61,6 +71,10 @@ import {
   findTaskJobSpecPda,
   findModerationConfigPda,
   findModerationAttestorPda,
+  findListingModerationPda,
+  findTaskModerationPda,
+  getListingModerationSize,
+  getTaskModerationSize,
   values,
 } from "@tetsuo-ai/marketplace-sdk";
 import { base58Decode, base58Encode } from "./base58.js";
@@ -370,7 +384,10 @@ export interface ModerationResult {
    * P1.2 `moderator` argument. Null in verdict-only mode (no signer).
    */
   moderator: string | null;
-  /** Present only on a CLEAN verdict that was signed + sent; null when held. */
+  /**
+   * Present only on a CLEAN verdict that this service signed + sent itself;
+   * null when held, and null when the caller pays (see `payment`).
+   */
   attestation: { signature: string; recordedAt: string; expiresAt: string | null } | null;
   /** sha256 of the moderation policy document (hex) the attestation commits to. */
   policyHash: string;
@@ -383,6 +400,171 @@ export interface ModerationResult {
   pinned?: boolean;
   /** Present only on attested results: https URL where the spec is retrievable. */
   specRegistryUri?: string;
+  /**
+   * Present on a CLEAN verdict when the caller named a `payer`. The approval is
+   * NOT recorded yet: the payer signs and sends the transaction in here, and
+   * the approval exists once that lands. `attestation` is null in this case;
+   * the retrievability fields are present as on an attested result.
+   */
+  payment?: RequesterPayment;
+}
+
+/**
+ * A CLEAN approval the requester pays for.
+ *
+ * One transaction, signed by this service, with the payer as fee payer. It
+ * first moves the deposit behind the new approval record from the payer to
+ * this service's signer, then records the approval (the program takes that
+ * same deposit from the signer). Both happen or neither does, so this service
+ * is never out of pocket and a payer never pays for an approval it does not
+ * get. Nothing is sent from here.
+ */
+export interface RequesterPayment {
+  /** Base64 wire transaction signed by this service. The payer signs and sends it. */
+  transaction: string;
+  /** The wallet that pays: the fee payer and the source of the deposit. */
+  payer: string;
+  /**
+   * Lamports the transaction moves from the payer to this service's signer:
+   * what the new approval record's deposit takes. "0" (and no transfer in the
+   * transaction) when the record already exists and is only being renewed.
+   */
+  depositLamports: string;
+  /** The transaction can land until the chain passes this block height. */
+  lastValidBlockHeight: string;
+  /** When the approval itself runs out; null when this deployment disables expiry. */
+  expiresAt: string | null;
+}
+
+const SYSTEM_PROGRAM_ADDRESS = address("11111111111111111111111111111111");
+const PAYER_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/** A System Program transfer, built by hand so no extra package is needed. */
+function systemTransfer(from: TransactionSigner, to: Address, lamports: bigint): Instruction {
+  const data = new Uint8Array(12);
+  const view = new DataView(data.buffer);
+  view.setUint32(0, 2, true); // SystemInstruction::Transfer
+  view.setBigUint64(4, lamports, true);
+  return {
+    programAddress: SYSTEM_PROGRAM_ADDRESS,
+    accounts: [
+      { address: from.address, role: AccountRole.WRITABLE_SIGNER, signer: from } as never,
+      { address: to, role: AccountRole.WRITABLE },
+    ],
+    data,
+  };
+}
+
+/**
+ * Vet the caller-named payer, and refuse a request that names none when this
+ * deployment does not pay for approvals. Runs before any chain read, scan or
+ * registry write is spent on the request. A deployment with no signer records
+ * nothing, so there is nothing to pay for and no payer is asked of it.
+ */
+function resolvePayer(
+  deps: AttestDeps,
+  raw: string | undefined,
+  moderator: TransactionSigner | null,
+): Address | null {
+  if (raw === undefined) {
+    if (moderator !== null && deps.requesterPays === true) {
+      throw new ModerationRejectError(
+        402,
+        "This service does not pay for approvals. Send the wallet that will pay as `payer`: the answer then carries the approval as a transaction for that wallet to sign and send.",
+      );
+    }
+    return null;
+  }
+  const trimmed = raw.trim();
+  let payer: Address | null = null;
+  if (PAYER_RE.test(trimmed)) {
+    try {
+      payer = address(trimmed);
+    } catch {
+      payer = null;
+    }
+  }
+  if (payer === null) {
+    throw new ModerationRejectError(
+      400,
+      "payer must be the base58 address of the wallet that will pay for the approval.",
+    );
+  }
+  if (moderator !== null && payer === moderator.address) {
+    throw new ModerationRejectError(400, "payer cannot be this service's own signer.");
+  }
+  return payer;
+}
+
+/**
+ * What recording into `record` will take from the recording signer.
+ *
+ * A record that does not exist costs the full deposit. A record this program
+ * already owns is reused at no cost. An address somebody sent lamports to
+ * first is topped up to the full deposit by the program, so only the shortfall
+ * is due. Those lamports cannot leave the address again, so the real cost at
+ * send time is never above what is computed here.
+ */
+async function recordDepositLamports(
+  rpc: ReturnType<typeof createSolanaRpc>,
+  record: Address,
+  recordSpace: number,
+): Promise<bigint> {
+  const [{ value: account }, rent] = await Promise.all([
+    rpc.getAccountInfo(record, { commitment: "confirmed", encoding: "base64" }).send(),
+    rpc
+      .getMinimumBalanceForRentExemption(BigInt(recordSpace), { commitment: "confirmed" })
+      .send(),
+  ]);
+  const full = BigInt(rent);
+  if (account === null) return full;
+  if (account.owner !== SYSTEM_PROGRAM_ADDRESS) return 0n;
+  const held = BigInt(account.lamports);
+  return held >= full ? 0n : full - held;
+}
+
+/**
+ * Build the requester-paid transaction for a CLEAN approval and sign this
+ * service's half of it. Nothing is sent and no SOL leaves this service.
+ */
+async function prepareRequesterPayment(params: {
+  rpcUrl: string;
+  instruction: Instruction;
+  moderator: TransactionSigner;
+  payer: Address;
+  /** The approval record the instruction writes. */
+  record: Address;
+  recordSpace: number;
+  expiresAtIso: string | null;
+}): Promise<RequesterPayment> {
+  const rpc = createSolanaRpc(params.rpcUrl);
+  const deposit = await recordDepositLamports(rpc, params.record, params.recordSpace);
+  const { value: latestBlockhash } = await rpc
+    .getLatestBlockhash({ commitment: "confirmed" })
+    .send();
+  // The payer signs later, on its own machine: here it is only named.
+  const payer = createNoopSigner(params.payer);
+  const instructions =
+    deposit > 0n
+      ? [systemTransfer(payer, params.moderator.address, deposit), params.instruction]
+      : [params.instruction];
+  const message = pipe(
+    createTransactionMessage({ version: 0 }),
+    (m) => setTransactionMessageFeePayerSigner(payer, m),
+    (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+    (m) => appendTransactionMessageInstructions(instructions, m),
+  );
+  const partial = await partiallySignTransactionMessageWithSigners(message);
+  if (!(partial.signatures[params.moderator.address] instanceof Uint8Array)) {
+    throw new Error("Moderation attestation transaction was not signed.");
+  }
+  return {
+    transaction: getBase64EncodedWireTransaction(partial),
+    payer: params.payer,
+    depositLamports: deposit.toString(),
+    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight.toString(),
+    expiresAt: params.expiresAtIso,
+  };
 }
 
 function firstTransactionSignatureBase58(signed: {
@@ -457,6 +639,13 @@ export interface AttestDeps {
   jobSpecRegistryUrl?: string;
   /** Operator registry write token; wallet upload tickets are used when null. */
   jobSpecRegistryToken?: string | null;
+  /**
+   * When true this service never pays for an approval: a request that names
+   * no `payer` is refused (402). A request that names one is always answered
+   * with a transaction for that payer, whatever this is set to. The HTTP
+   * service turns this on unless REQUESTER_PAYS says otherwise.
+   */
+  requesterPays?: boolean;
 }
 
 /**
@@ -468,9 +657,16 @@ export interface AttestDeps {
  */
 export async function attestListing(
   deps: AttestDeps,
-  params: { listing: string; spec?: Record<string, unknown>; specUri?: string },
+  params: {
+    listing: string;
+    spec?: Record<string, unknown>;
+    specUri?: string;
+    /** The wallet that pays for the approval and sends it (see {@link RequesterPayment}). */
+    payer?: string;
+  },
 ): Promise<ModerationResult> {
   const moderator = await tryLoadModeratorSigner();
+  const payer = resolvePayer(deps, params.payer, moderator);
   const rpc = createSolanaRpc(deps.rpcUrl);
   const listingAddr = address(params.listing);
 
@@ -530,6 +726,32 @@ export async function attestListing(
     expiresAt: ttl.onChain,
   })) as Instruction;
 
+  if (payer !== null) {
+    const [record] = await findListingModerationPda({
+      listing: listingAddr,
+      jobSpecHash: resolved.specHashBytes,
+      moderator: moderator.address,
+    });
+    return {
+      verdict: scan.verdict,
+      riskScore: scan.riskScore,
+      specHash: resolved.specHashHex,
+      moderator: moderator.address,
+      attestation: null,
+      policyHash,
+      ...attestedRetrievabilityFields(retrievability),
+      payment: await prepareRequesterPayment({
+        rpcUrl: deps.rpcUrl,
+        instruction,
+        moderator,
+        payer,
+        record,
+        recordSpace: getListingModerationSize(),
+        expiresAtIso: ttl.iso,
+      }),
+    };
+  }
+
   const signature = await signAndSend(deps.rpcUrl, instruction, moderator);
   return {
     verdict: scan.verdict,
@@ -577,9 +799,12 @@ export async function attestTask(
     specUri?: string;
     /** Raw submitted text for the legacy content-addressed binding (compat endpoint). */
     rawText?: string;
+    /** The wallet that pays for the approval and sends it (see {@link RequesterPayment}). */
+    payer?: string;
   },
 ): Promise<ModerationResult> {
   const moderator = await tryLoadModeratorSigner();
+  const payer = resolvePayer(deps, params.payer, moderator);
   const rpc = createSolanaRpc(deps.rpcUrl);
   const taskAddr = address(params.task);
   let taskAccount: Awaited<ReturnType<typeof fetchMaybeTask>> | null = null;
@@ -725,6 +950,32 @@ export async function attestTask(
     scannerHash: scannerHashBytes(),
     expiresAt: ttl.onChain,
   })) as Instruction;
+
+  if (payer !== null) {
+    const [record] = await findTaskModerationPda({
+      task: taskAddr,
+      jobSpecHash: resolved.specHashBytes,
+      moderator: moderator.address,
+    });
+    return {
+      verdict: scan.verdict,
+      riskScore: scan.riskScore,
+      specHash: resolved.specHashHex,
+      moderator: moderator.address,
+      attestation: null,
+      policyHash,
+      ...attestedRetrievabilityFields(retrievability),
+      payment: await prepareRequesterPayment({
+        rpcUrl: deps.rpcUrl,
+        instruction,
+        moderator,
+        payer,
+        record,
+        recordSpace: getTaskModerationSize(),
+        expiresAtIso: ttl.iso,
+      }),
+    };
+  }
 
   const signature = await signAndSend(deps.rpcUrl, instruction, moderator);
   return {

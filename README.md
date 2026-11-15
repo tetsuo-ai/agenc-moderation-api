@@ -14,8 +14,9 @@ attestor that records them:
    spec hash the on-chain gate is seeded with,
 3. scans it with the published deterministic policy (`GET /v1/policy` — its
    sha-256 is the `policy_hash` every attestation commits to), and
-4. on a `clean` verdict signs + sends the on-chain `record_*_moderation`
-   transaction and returns the signature. `suspicious`/`blocked` verdicts are
+4. on a `clean` verdict signs the on-chain `record_*_moderation` transaction
+   and hands it back for the caller to pay for and send (see
+   [Who pays](#who-pays-for-an-approval)). `suspicious`/`blocked` verdicts are
    **held** — never signed.
 
 No kit entitlement, no account, no SDK required — plain HTTPS + JSON. In
@@ -35,8 +36,37 @@ GET  https://attest.agenc.ag/v1/info
 GET  https://attest.agenc.ag/openapi.json
 ```
 
-Open + rate-limited (per-IP and a service-wide ceiling — every clean verdict
-signs and pays a real mainnet transaction).
+Open + rate-limited (per-IP and a service-wide ceiling).
+
+### Who pays for an approval
+
+The caller does. The program takes a deposit from the recording signer for
+every new approval record (about 0.0018 SOL at today's rent) and never returns
+it, so a service that paid it for everyone would be drained by whoever asked
+most. Instead:
+
+1. Send the wallet that will pay as `payer` with your request.
+2. A `clean` answer carries `payment.transaction`: one transaction, already
+   signed by this service, in which `payer` is the fee payer, first hands the
+   service's signer exactly the deposit (`payment.depositLamports`), and then
+   the approval is recorded. Both happen or neither does.
+3. Check it, add `payer`'s signature and send it before
+   `payment.lastValidBlockHeight`. The approval exists once it lands; until
+   then `attested` is `false` and `attestation` is `null`.
+
+Check before you sign: the fee payer is your wallet; there are no address
+lookup tables; the only instructions are a System transfer from your wallet to
+`moderator` of at most the record's rent, and one `record_task_moderation` /
+`record_listing_moderation` of program
+`HJsZ53Zb27b8QMRbQpuDngE44AdwCGxvEZr61Zmxw1xK` for your task or listing and
+your hash, in which your wallet does not appear.
+
+A record that already exists costs nothing to renew: `depositLamports` is
+`"0"` and the transaction holds only the approval.
+
+A request with no `payer` is refused with **HTTP 402**. A self-hoster who
+wants their own signer to pay for every approval sets `REQUESTER_PAYS=false`;
+`GET /v1/info` reports which (`requesterPays`).
 
 ### Attest a task job spec (pre-pin — the external-marketplace flow)
 
@@ -49,7 +79,8 @@ curl -sX POST https://attest.agenc.ag/v1/moderation/tasks \
   -d '{
     "task": "<TASK_PDA>",
     "jobSpecHash": "<64-hex canonical payload hash>",
-    "spec": { "kind": "agenc.marketplace.jobSpec", "title": "...", ... }
+    "spec": { "kind": "agenc.marketplace.jobSpec", "title": "...", ... },
+    "payer": "<WALLET THAT PAYS>"
   }'
 ```
 
@@ -58,17 +89,30 @@ Response (`clean`):
 ```json
 {
   "ok": true,
-  "attested": true,
+  "attested": false,
   "verdict": "clean",
   "riskScore": 0,
   "specHash": "<64-hex>",
-  "attestation": { "signature": "<tx>", "recordedAt": "…", "expiresAt": "…" },
+  "moderator": "<this service's signer>",
+  "attestation": null,
   "policyHash": "<64-hex>",
   "retrievable": true,
   "pinned": false,
-  "specRegistryUri": "https://marketplace.agenc.tech/api/job-specs/<64-hex>"
+  "specRegistryUri": "https://marketplace.agenc.tech/api/job-specs/<64-hex>",
+  "payment": {
+    "transaction": "<base64, signed by the service; sign as payer and send>",
+    "payer": "<WALLET THAT PAYS>",
+    "depositLamports": "1838960",
+    "lastValidBlockHeight": "…",
+    "expiresAt": "…"
+  }
 }
 ```
+
+Present `moderator` at `set_task_job_spec` once the transaction has landed.
+On a deployment that pays for approvals itself (`REQUESTER_PAYS=false`) a
+request without `payer` is recorded by the service: `attested` is `true` and
+`attestation` is `{ "signature": "<tx>", "recordedAt": "…", "expiresAt": "…" }`.
 
 `jobSpecHash` is the `json-stable-v1` canonical-JSON sha-256 of the payload —
 compute it with `values.canonicalJobSpecHash` from
@@ -116,7 +160,7 @@ bytes at an https URL and pass it as `specUri` instead.
 ```bash
 curl -sX POST https://attest.agenc.ag/v1/moderation/listings \
   -H 'content-type: application/json' \
-  -d '{ "listing": "<LISTING_PDA>" }'
+  -d '{ "listing": "<LISTING_PDA>", "payer": "<WALLET THAT PAYS>" }'
 ```
 
 The on-chain `spec_uri` is fetched behind an SSRF guard and must hash to the
@@ -130,7 +174,10 @@ retrievable copy is verified or pinned.
 `create-agenc-store` stores (`store-core`'s remote attestor) and the hosted
 kit backend's route, and answers `{ attested, moderation, txSignature }`.
 Point `moderation.attestorEndpoint` in your store config at
-`https://attest.agenc.ag/api/task-moderation/attest` — no other change needed.
+`https://attest.agenc.ag/api/task-moderation/attest`. It takes `payer` like
+the other endpoints and then also answers `moderator` and `payment`; a caller
+that sends no `payer` is refused (402) unless the deployment pays for
+approvals itself.
 
 ## Verdicts
 
@@ -216,8 +263,10 @@ Re-registering later re-inits a fresh entry.
 ### Key custody
 
 - Generate a **dedicated keypair** for attestation — never reuse a treasury or
-  upgrade key. `solana-keygen new -o attestor.json`, fund it with a little SOL
-  (each attestation pays a tx fee + the moderation PDA's rent).
+  upgrade key. `solana-keygen new -o attestor.json`. With callers paying (the
+  default) it needs no SOL for approvals; with `REQUESTER_PAYS=false` fund it
+  with a little SOL (each attestation then pays a tx fee + the moderation
+  PDA's rent out of it).
 - Inject it via your platform's secret store (Vercel env var, docker/k8s
   secret, systemd `LoadCredential`) — never commit it, never pass it in shell
   history if avoidable.
@@ -257,7 +306,7 @@ RPC_URL=http://127.0.0.1:8899 CLUSTER_LABEL=localnet ATTESTATION_TTL_SECONDS=0 \
 
 # 3. attest a task created on localnet
 curl -sX POST localhost:8787/v1/moderation/tasks -H 'content-type: application/json' \
-  -d '{"task":"<TASK_PDA>","jobSpecHash":"<hex>","spec":{...}}'
+  -d '{"task":"<TASK_PDA>","jobSpecHash":"<hex>","spec":{...},"payer":"<WALLET>"}'
 ```
 
 ## Verify a deployment

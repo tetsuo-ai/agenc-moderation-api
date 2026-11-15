@@ -37,12 +37,22 @@ export interface ServiceConfig {
   /** Per-IP requests per window for POST endpoints. */
   rateLimitPerIp: number;
   /**
-   * GLOBAL POST ceiling per window across all callers — the economic bound on
-   * the hot signer key (each CLEAN attest signs + pays a mainnet tx).
+   * GLOBAL POST ceiling per window across all callers. With `requesterPays`
+   * off it is the economic bound on the hot signer key (each CLEAN attest then
+   * signs + pays a mainnet tx); with it on it bounds registry writes and load.
    */
   rateLimitGlobal: number;
   /** Rate-limit window in milliseconds. */
   rateLimitWindowMs: number;
+  /**
+   * Who pays for an approval. True (the default): the caller does. A request
+   * must name the wallet that pays (`payer`) and gets the approval back as a
+   * transaction for that wallet to sign and send; a request without one is
+   * refused, and this service's signer spends nothing. False: a request
+   * without a `payer` is recorded and paid for by this service's signer, as
+   * every request used to be.
+   */
+  requesterPays: boolean;
   /** Optional Upstash REST binding for a cross-instance shared limiter. */
   upstashUrl: string | null;
   upstashToken: string | null;
@@ -54,6 +64,12 @@ function intEnv(name: string, fallback: number, min = 0): number {
   const parsed = Number.parseInt(raw.trim(), 10);
   if (!Number.isFinite(parsed) || parsed < min) return fallback;
   return parsed;
+}
+
+/** A switch that is on unless it is plainly turned off. */
+function onUnlessOff(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
 }
 
 function nonEmpty(value: string | undefined): string | null {
@@ -80,6 +96,7 @@ export function loadConfig(): ServiceConfig {
     rateLimitPerIp: intEnv("RATE_LIMIT_PER_IP", 6, 1),
     rateLimitGlobal: intEnv("RATE_LIMIT_GLOBAL", 60, 1),
     rateLimitWindowMs: intEnv("RATE_LIMIT_WINDOW_MS", 60_000, 1_000),
+    requesterPays: onUnlessOff("REQUESTER_PAYS"),
     upstashUrl: nonEmpty(process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL),
     upstashToken: nonEmpty(process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN),
   };

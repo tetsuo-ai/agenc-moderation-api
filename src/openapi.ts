@@ -13,7 +13,9 @@ const moderationResult = {
     ok: { type: "boolean" },
     attested: {
       type: "boolean",
-      description: "True when a CLEAN verdict was recorded on-chain.",
+      description:
+        "True when a CLEAN verdict was recorded on-chain by this service. False when the " +
+        "caller pays: the approval is then recorded by the transaction in `payment`.",
     },
     verdict: { type: "string", enum: ["clean", "suspicious", "blocked"] },
     riskScore: { type: "integer", minimum: 0, maximum: 100 },
@@ -39,7 +41,47 @@ const moderationResult = {
         },
         { type: "null" },
       ],
-      description: "Present only for a CLEAN verdict that was signed + confirmed; null when held.",
+      description:
+        "Present only for a CLEAN verdict this service signed + sent itself; null when held, " +
+        "and null when the caller pays (see `payment`).",
+    },
+    moderator: {
+      type: ["string", "null"],
+      description:
+        "The signer whose record a consumption gate must name as its `moderator`. Null in " +
+        "verdict-only mode.",
+    },
+    payment: {
+      type: "object",
+      required: ["transaction", "payer", "depositLamports", "lastValidBlockHeight", "expiresAt"],
+      description:
+        "Present on a CLEAN verdict when the request named a `payer`. The approval is not " +
+        "recorded yet: the payer signs and sends `transaction`.",
+      properties: {
+        transaction: {
+          type: "string",
+          description:
+            "Base64 wire transaction signed by this service. The payer is its fee payer; it " +
+            "holds a System transfer of `depositLamports` from the payer to `moderator` (left " +
+            "out when that is 0) followed by one record_*_moderation instruction.",
+        },
+        payer: { type: "string", description: "The wallet that pays (base58)." },
+        depositLamports: {
+          type: "string",
+          description:
+            "Lamports moved from the payer to this service's signer: the deposit the new " +
+            "approval record takes. \"0\" when the record already exists.",
+        },
+        lastValidBlockHeight: {
+          type: "string",
+          description: "The transaction can land until the chain passes this block height.",
+        },
+        expiresAt: {
+          type: ["string", "null"],
+          format: "date-time",
+          description: "When the approval itself runs out; null when expiry is disabled.",
+        },
+      },
     },
     policyHash: {
       type: "string",
@@ -64,6 +106,20 @@ const moderationResult = {
       description: "Present only on attested results: https URL where the spec is retrievable.",
     },
   },
+} as const;
+
+const payerProperty = {
+  type: "string",
+  description:
+    "The wallet that pays for the approval (base58). A CLEAN answer then carries `payment`: " +
+    "the approval as a transaction for this wallet to sign and send. Required unless the " +
+    "deployment pays for approvals itself (GET /v1/info → requesterPays: false).",
+} as const;
+
+const payerRequiredResponse = {
+  description:
+    "This deployment does not pay for approvals and the request named no `payer`.",
+  content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 } as const;
 
 const specNotRetrievableDescription =
@@ -118,6 +174,7 @@ export function openApiDocument(): Record<string, unknown> {
                     listing: { type: "string", description: "ServiceListing PDA (base58)." },
                     spec: { type: "object", description: "Inline job-spec envelope or payload." },
                     specUri: { type: "string", description: "https URL of the hosted spec." },
+                    payer: payerProperty,
                   },
                 },
               },
@@ -126,6 +183,7 @@ export function openApiDocument(): Record<string, unknown> {
           responses: {
             "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
             "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
+            "402": payerRequiredResponse,
             "404": { description: "Listing not found on-chain.", content: { "application/json": { schema: errorShape } } },
             "409": { description: specNotRetrievableDescription, content: { "application/json": { schema: errorShape } } },
             "422": { description: "Spec does not hash to the on-chain spec_hash.", content: { "application/json": { schema: errorShape } } },
@@ -159,6 +217,7 @@ export function openApiDocument(): Record<string, unknown> {
                     jobSpecHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
                     spec: { type: "object" },
                     specUri: { type: "string" },
+                    payer: payerProperty,
                   },
                 },
               },
@@ -167,6 +226,7 @@ export function openApiDocument(): Record<string, unknown> {
           responses: {
             "200": { description: "Verdict (and attestation when clean).", content: { "application/json": { schema: moderationResult } } },
             "400": { description: "Malformed request.", content: { "application/json": { schema: errorShape } } },
+            "402": payerRequiredResponse,
             "404": { description: "Task not found on-chain.", content: { "application/json": { schema: errorShape } } },
             "409": {
               description: `No job spec pinned and none provided; or ${specNotRetrievableDescription}`,
@@ -204,6 +264,7 @@ export function openApiDocument(): Record<string, unknown> {
                     },
                     jobSpecCanonicalJson: { type: "string" },
                     text: { type: "string" },
+                    payer: payerProperty,
                   },
                 },
               },
@@ -229,6 +290,11 @@ export function openApiDocument(): Record<string, unknown> {
                       },
                       pinned: { type: "boolean", description: "Present only when attested." },
                       specRegistryUri: { type: "string", description: "Present only when attested." },
+                      moderator: {
+                        type: "string",
+                        description: "Present with `payment`: this service's signer.",
+                      },
+                      payment: moderationResult.properties.payment,
                     },
                   },
                 },
@@ -255,6 +321,7 @@ export function openApiDocument(): Record<string, unknown> {
       },
     },
     components: {
+      schemas: { Error: errorShape },
       securitySchemes: {
         bearerKey: {
           type: "http",

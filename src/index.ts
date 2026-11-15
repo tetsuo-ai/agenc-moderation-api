@@ -7,6 +7,7 @@ export {
   ModerationSignerUnavailableError,
   SpecNotRetrievableError,
   type ModerationResult,
+  type RequesterPayment,
   type AttestDeps,
 } from "./signer.js";
 export {
