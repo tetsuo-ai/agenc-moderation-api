@@ -5,10 +5,15 @@
  * PUBLIC endpoints (CORS-open; POST endpoints are rate-limited and optionally
  * API-keyed — plain bearer keys, NOT kit-entitlement gating):
  *
- *   POST /v1/moderation/listings   { listing, spec? | specUri? }
- *   POST /v1/moderation/tasks      { task, jobSpecHash?, spec? | specUri? }
+ *   POST /v1/moderation/listings   { listing, spec? | specUri?, payer? }
+ *   POST /v1/moderation/tasks      { task, jobSpecHash?, spec? | specUri?, payer? }
  *   POST /api/task-moderation/attest   (compatibility: store-core remote
  *        attestor + agenc.ag proxy shapes) → { attested, moderation, txSignature }
+ *
+ * `payer` is the wallet that pays for the approval. With one, a CLEAN answer
+ * carries `payment`: the approval as a transaction signed by this service,
+ * for that wallet to sign and send. Without one the request is refused (402)
+ * unless the deployment sets REQUESTER_PAYS=false and pays itself.
  *   GET  /v1/policy      the exact policy bytes (sha256 == policy_hash)
  *   GET  /v1/info        service identity: signer pubkey, cluster, hashes, TTL
  *   GET  /v1/health      liveness
@@ -157,7 +162,18 @@ function attestDeps(config: ServiceConfig): AttestDeps {
     attestationTtlSeconds: config.attestationTtlSeconds,
     jobSpecRegistryUrl: config.jobSpecRegistryUrl,
     jobSpecRegistryToken: config.jobSpecRegistryToken,
+    requesterPays: config.requesterPays,
   };
+}
+
+/**
+ * The wallet a caller names to pay for the approval. Anything that is not a
+ * string is passed on as an empty one, so the signer refuses it as malformed
+ * instead of treating the request as one that named no payer.
+ */
+function payerField(body: Record<string, unknown>): string | undefined {
+  if (body.payer === undefined || body.payer === null) return undefined;
+  return typeof body.payer === "string" ? body.payer : "";
 }
 
 async function handleListings(config: ServiceConfig, request: Request): Promise<Response> {
@@ -170,6 +186,7 @@ async function handleListings(config: ServiceConfig, request: Request): Promise<
     listing,
     spec: optionalObject(body.spec),
     specUri: optionalString(body.specUri),
+    payer: payerField(body),
   });
   return json({ ok: true, attested: result.attestation !== null, ...result });
 }
@@ -189,6 +206,7 @@ async function handleTasks(config: ServiceConfig, request: Request): Promise<Res
     jobSpecHash,
     spec: optionalObject(body.spec),
     specUri: optionalString(body.specUri),
+    payer: payerField(body),
   });
   return json({ ok: true, attested: result.attestation !== null, ...result });
 }
@@ -205,7 +223,9 @@ async function handleTasks(config: ServiceConfig, request: Request): Promise<Res
  * Both reduce to pre-pin task attestation. The hash check is fail-closed:
  * the canonical payload hash OR the raw text-bytes sha256 must equal
  * `jobSpecHash` (the hash the task will pin). Responds with the kit-backend
- * shape `{ attested, moderation, txSignature }`.
+ * shape `{ attested, moderation, txSignature }`, plus `payment` and
+ * `moderator` when the caller named a `payer` (the approval is then the
+ * caller's to sign and send, so `attested` is false and `txSignature` null).
  */
 async function handleCompatAttest(config: ServiceConfig, request: Request): Promise<Response> {
   const body = await readJsonBody(request);
@@ -264,6 +284,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
     spec,
     specUri: optionalString(body.jobSpecUri),
     rawText,
+    payer: payerField(body),
   });
   return json({
     ok: true,
@@ -278,13 +299,14 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
       ...(payloadHashFromText ? { payloadHash: payloadHashFromText } : {}),
     },
     txSignature: result.attestation?.signature ?? null,
-    ...(result.attestation
+    ...(result.attestation || result.payment
       ? {
           retrievable: result.retrievable,
           pinned: result.pinned,
           specRegistryUri: result.specRegistryUri,
         }
       : {}),
+    ...(result.payment ? { moderator: result.moderator, payment: result.payment } : {}),
   });
 }
 
@@ -309,6 +331,9 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
     scannerHash: scannerHashHex(),
     scannerDescriptor: SCANNER_DESCRIPTOR,
     attestationTtlSeconds: config.attestationTtlSeconds,
+    // Who pays for an approval: the caller (it names a `payer` and sends the
+    // transaction it gets back) or, when false, this service's signer.
+    requesterPays: config.requesterPays,
     // The retrievability gate: every attestation implies retrievable content.
     jobSpecRegistry: {
       url: config.jobSpecRegistryUrl,

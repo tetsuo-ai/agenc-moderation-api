@@ -404,6 +404,8 @@ describe("attestTask retrievability gate (signer configured)", () => {
     const handler = createModerationApi({
       jobSpecRegistryUrl: REGISTRY,
       jobSpecRegistryToken: null,
+      // These two cover a deployment that pays for approvals itself.
+      requesterPays: false,
     });
     const response = await handler(
       new Request("http://svc.test/api/task-moderation/attest", {
@@ -460,6 +462,8 @@ describe("attestTask retrievability gate (signer configured)", () => {
     const handler = createModerationApi({
       jobSpecRegistryUrl: REGISTRY,
       jobSpecRegistryToken: null,
+      // These two cover a deployment that pays for approvals itself.
+      requesterPays: false,
     });
     const response = await handler(
       new Request("http://svc.test/api/task-moderation/attest", {
