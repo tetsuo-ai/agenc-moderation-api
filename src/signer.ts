@@ -28,15 +28,32 @@
  *    (`[..., task/listing, job_spec_hash, moderator]`) — consumers present
  *    THIS service's moderator pubkey at the consumption gates.
  *
- * WHO PAYS. The program makes the recording signer pay the deposit behind
- * each new approval record, and that deposit is never returned. A caller that
- * names a `payer` gets the approval back as a transaction signed by this
- * service, in which the payer first hands this service's signer that deposit
- * and is the fee payer; the payer signs and sends it, and this service spends
- * nothing (see {@link RequesterPayment}). Without a `payer` THIS SERVICE SIGNS
- * AND PAYS A REAL TRANSACTION on whatever cluster RPC_URL points at, unless
- * the deployment requires a payer (`requesterPays`), in which case the request
- * is refused. The router's per-IP + global rate limits bound the rest.
+ * WHO PAYS. Every new approval record holds a deposit (its rent). A caller
+ * that names a `payer` gets the approval back as a transaction signed by this
+ * service, with the payer as fee payer; the payer signs and sends it, and this
+ * service spends nothing (see {@link RequesterPayment}).
+ *
+ *  - Task approvals (revision 9): the payer must be the task's creator. It is
+ *    the record's `rent_payer`, so the program takes the deposit from it
+ *    directly and the record remembers who paid: when the task is closed, the
+ *    deposit goes back to the creator. The transaction holds that one
+ *    instruction and no transfer.
+ *  - Listing approvals: unchanged. The payer first hands this service's signer
+ *    the deposit, then the program takes it from the signer. That deposit is
+ *    not returned.
+ *
+ * Without a `payer` THIS SERVICE SIGNS AND PAYS A REAL TRANSACTION on whatever
+ * cluster RPC_URL points at (its signer is then the rent payer and gets a task
+ * record's deposit back at close), unless the deployment requires a payer
+ * (`requesterPays`), in which case the request is refused. The router's
+ * per-IP + global rate limits bound the rest.
+ *
+ * REFUSALS BEFORE SIGNING (revision 9 program rules, checked here so a caller
+ * gets a clear answer instead of a failed transaction): a task whose creator
+ * is this service's signer (program error 6432), a listing whose provider
+ * wallet is this service's signer (6434), a task payer that is not the task's
+ * creator (6433), and any program stamp other than revision 9
+ * (`revision.ts`).
  */
 
 import { createHash } from "node:crypto";
@@ -92,6 +109,17 @@ import {
   unwrapPayload,
   type SpecRetrievability,
 } from "./retrievability.js";
+import { requireSigningRevision } from "./revision.js";
+
+/** Machine-readable codes of the revision 9 refusals made before signing. */
+export const REFUSAL_CODES = {
+  /** Program error 6432 `ModeratorIsTaskCreator`. */
+  moderatorIsTaskCreator: "MODERATOR_IS_TASK_CREATOR",
+  /** Program error 6434 `ModeratorIsListingProvider`. */
+  moderatorIsListingProvider: "MODERATOR_IS_LISTING_PROVIDER",
+  /** Program error 6433 `InvalidModerationRentPayer`. */
+  payerNotTaskCreator: "PAYER_NOT_TASK_CREATOR",
+} as const;
 
 /* ================================ errors ================================= */
 
@@ -412,12 +440,19 @@ export interface ModerationResult {
 /**
  * A CLEAN approval the requester pays for.
  *
- * One transaction, signed by this service, with the payer as fee payer. It
- * first moves the deposit behind the new approval record from the payer to
- * this service's signer, then records the approval (the program takes that
- * same deposit from the signer). Both happen or neither does, so this service
- * is never out of pocket and a payer never pays for an approval it does not
- * get. Nothing is sent from here.
+ * One transaction, signed by this service, with the payer as fee payer.
+ *
+ *  - Task (revision 9): one `record_task_moderation` instruction in which the
+ *    payer, the task's creator, is the record's rent payer (its last account).
+ *    The program takes the deposit from the payer and returns it to the
+ *    creator when the task is closed.
+ *  - Listing: a transfer of the deposit from the payer to this service's
+ *    signer, then `record_listing_moderation` (the program takes that same
+ *    deposit from the signer). The transfer is left out when nothing is due.
+ *
+ * Either way both happen or neither does, so this service is never out of
+ * pocket and a payer never pays for an approval it does not get. Nothing is
+ * sent from here.
  */
 export interface RequesterPayment {
   /** Base64 wire transaction signed by this service. The payer signs and sends it. */
@@ -425,9 +460,11 @@ export interface RequesterPayment {
   /** The wallet that pays: the fee payer and the source of the deposit. */
   payer: string;
   /**
-   * Lamports the transaction moves from the payer to this service's signer:
-   * what the new approval record's deposit takes. "0" (and no transfer in the
-   * transaction) when the record already exists and is only being renewed.
+   * Lamports the new approval record's deposit takes from the payer: for a
+   * task, taken by the program from the payer as the record's rent payer; for
+   * a listing, the transfer to this service's signer. "0" when the record
+   * already exists and is only being renewed (for a listing the transfer is
+   * then left out).
    */
   depositLamports: string;
   /** The transaction can land until the chain passes this block height. */
@@ -531,10 +568,22 @@ async function prepareRequesterPayment(params: {
   rpcUrl: string;
   instruction: Instruction;
   moderator: TransactionSigner;
-  payer: Address;
+  /**
+   * The payer, only named: it signs later, on its own machine. The same
+   * object a task's instruction names as its rent payer.
+   */
+  payer: TransactionSigner;
   /** The approval record the instruction writes. */
   record: Address;
   recordSpace: number;
+  /**
+   * How the payer covers the deposit. "rent-payer": the payer is the record's
+   * rent payer inside `instruction` (a task approval, revision 9), so the
+   * program charges it directly and nothing is added. "transfer": the payer
+   * first hands the deposit to this service's signer, which the program then
+   * charges (a listing approval).
+   */
+  deposit: "rent-payer" | "transfer";
   expiresAtIso: string | null;
 }): Promise<RequesterPayment> {
   const rpc = createSolanaRpc(params.rpcUrl);
@@ -542,10 +591,9 @@ async function prepareRequesterPayment(params: {
   const { value: latestBlockhash } = await rpc
     .getLatestBlockhash({ commitment: "confirmed" })
     .send();
-  // The payer signs later, on its own machine: here it is only named.
-  const payer = createNoopSigner(params.payer);
+  const payer = params.payer;
   const instructions =
-    deposit > 0n
+    params.deposit === "transfer" && deposit > 0n
       ? [systemTransfer(payer, params.moderator.address, deposit), params.instruction]
       : [params.instruction];
   const message = pipe(
@@ -560,7 +608,7 @@ async function prepareRequesterPayment(params: {
   }
   return {
     transaction: getBase64EncodedWireTransaction(partial),
-    payer: params.payer,
+    payer: payer.address,
     depositLamports: deposit.toString(),
     lastValidBlockHeight: latestBlockhash.lastValidBlockHeight.toString(),
     expiresAt: params.expiresAtIso,
@@ -578,13 +626,16 @@ function firstTransactionSignatureBase58(signed: {
 }
 
 /**
- * Build + sign + send one moderation attestation transaction. The moderator is
- * the fee payer + the only signer. Returns the confirmed signature.
+ * Build + sign + send one transaction holding `instruction`. The moderator is
+ * the fee payer + the only signer. Returns the confirmed signature. Used for
+ * service-paid attestations and for the liveness heartbeat (`heartbeat.ts`);
+ * `what` names the transaction in errors.
  */
-async function signAndSend(
+export async function signAndSend(
   rpcUrl: string,
   instruction: Instruction,
   moderator: TransactionSigner,
+  what = "Moderation attestation",
 ): Promise<string> {
   const rpc = createSolanaRpc(rpcUrl);
   const { value: latestBlockhash } = await rpc
@@ -610,16 +661,14 @@ async function signAndSend(
     const status = value[0];
     if (status) {
       if (status.err != null) {
-        throw new Error(`Moderation attestation failed on-chain (signature ${sig}).`);
+        throw new Error(`${what} failed on-chain (signature ${sig}).`);
       }
       if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") {
         return sig;
       }
     }
     if (Date.now() >= deadline) {
-      throw new Error(
-        `Moderation attestation confirmation timed out (signature ${sig}). It may still land.`,
-      );
+      throw new Error(`${what} confirmation timed out (signature ${sig}). It may still land.`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1_500));
   }
@@ -674,6 +723,16 @@ export async function attestListing(
   if (!maybe.exists) {
     throw new ModerationRejectError(404, "This listing does not exist on-chain.");
   }
+  // Revision 9: a provider cannot moderate its own listing (program error
+  // 6434). Refused here, before any scan or registry work, instead of handing
+  // out a transaction the program would fail.
+  if (moderator !== null && String(maybe.data.authority) === moderator.address) {
+    throw new ModerationRejectError(
+      422,
+      "This service's signer is the provider of this listing. A provider cannot moderate its own listing, so this service will not approve it. Ask another attestor.",
+      { code: REFUSAL_CODES.moderatorIsListingProvider },
+    );
+  }
   const onChainSpecHashHex = toHex(maybe.data.specHash as Uint8Array);
   const resolved = await resolveSpecAgainstHash({
     targetHashHex: onChainSpecHashHex,
@@ -697,10 +756,12 @@ export async function attestListing(
   }
 
   const mode = await resolveSignerMode(rpc, moderator);
+  // Sign only for the program revision this build speaks (revision.ts).
+  await requireSigningRevision(rpc);
 
   // Every attestation implies retrievable content — fail-closed before signing
-  // (after signer-mode validation, so a misconfigured deployment never spends
-  // registry writes).
+  // (after signer-mode and revision checks, so a misconfigured deployment
+  // never spends registry writes).
   const retrievability = await ensureSpecRetrievable({
     registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
     registryToken: deps.jobSpecRegistryToken ?? null,
@@ -744,9 +805,11 @@ export async function attestListing(
         rpcUrl: deps.rpcUrl,
         instruction,
         moderator,
-        payer,
+        // The payer signs later, on its own machine: here it is only named.
+        payer: createNoopSigner(payer),
         record,
         recordSpace: getListingModerationSize(),
+        deposit: "transfer",
         expiresAtIso: ttl.iso,
       }),
     };
@@ -815,6 +878,30 @@ export async function attestTask(
     taskAccount = await fetchMaybeTask(rpc, taskAddr);
     if (!taskAccount.exists) {
       throw new ModerationRejectError(404, "This task does not exist on-chain.");
+    }
+  }
+
+  // Revision 9 program rules, refused here before any scan, registry or
+  // signing work, so a caller gets a clear answer instead of a failed
+  // transaction. Only a deployment that signs reaches them.
+  if (moderator !== null && taskAccount?.exists) {
+    const creator = String(taskAccount.data.creator);
+    if (creator === moderator.address) {
+      // Program error 6432: a task creator cannot moderate its own task.
+      throw new ModerationRejectError(
+        422,
+        "This service's signer created this task. A task creator cannot moderate its own task, so this service will not approve it. Ask another attestor.",
+        { code: REFUSAL_CODES.moderatorIsTaskCreator },
+      );
+    }
+    if (payer !== null && payer !== creator) {
+      // Program error 6433: only the creator (or the moderator) may pay the
+      // record's rent, and the record returns the deposit to whoever paid.
+      throw new ModerationRejectError(
+        422,
+        "payer must be the task's creator. The creator pays the approval record's deposit and gets it back when the task is closed.",
+        { code: REFUSAL_CODES.payerNotTaskCreator },
+      );
     }
   }
 
@@ -920,12 +1007,14 @@ export async function attestTask(
   }
 
   const mode = await resolveSignerMode(rpc, moderator);
+  // Sign only for the program revision this build speaks (revision.ts).
+  await requireSigningRevision(rpc);
 
   // Every attestation implies retrievable content — fail-closed before
   // signing. A CLEAN record for a spec nobody can fetch produces a task
   // workers can claim but never read (the dead-spec incident shape). Runs
-  // after signer-mode validation so a misconfigured deployment never spends
-  // registry writes.
+  // after signer-mode and revision checks so a misconfigured deployment never
+  // spends registry writes.
   const retrievability = await ensureSpecRetrievable({
     registryUrl: deps.jobSpecRegistryUrl ?? DEFAULT_JOB_SPEC_REGISTRY_URL,
     registryToken: deps.jobSpecRegistryToken ?? null,
@@ -938,10 +1027,17 @@ export async function attestTask(
   });
 
   const ttl = expiresAt(deps.attestationTtlSeconds);
+  // Revision 9: the record's rent payer. With a `payer` (checked above to be
+  // the task's creator) the buyer pays the deposit itself and gets it back at
+  // close; it signs later, on its own machine, so here it is only named.
+  // Without one the facade's default applies: this service's signer pays and
+  // gets it back.
+  const rentPayer = payer !== null ? createNoopSigner(payer) : null;
   const instruction = (await facade.recordTaskModeration({
     task: taskAddr,
     moderator,
     ...(mode.moderationAttestor ? { moderationAttestor: mode.moderationAttestor } : {}),
+    ...(rentPayer ? { rentPayer } : {}),
     jobSpecHash: resolved.specHashBytes,
     status: MODERATION_STATUS.CLEAN,
     riskScore: scan.riskScore,
@@ -951,7 +1047,7 @@ export async function attestTask(
     expiresAt: ttl.onChain,
   })) as Instruction;
 
-  if (payer !== null) {
+  if (rentPayer !== null) {
     const [record] = await findTaskModerationPda({
       task: taskAddr,
       jobSpecHash: resolved.specHashBytes,
@@ -969,9 +1065,10 @@ export async function attestTask(
         rpcUrl: deps.rpcUrl,
         instruction,
         moderator,
-        payer,
+        payer: rentPayer,
         record,
         recordSpace: getTaskModerationSize(),
+        deposit: "rent-payer",
         expiresAtIso: ttl.iso,
       }),
     };

@@ -12,14 +12,24 @@ export class ModerationSignerUnavailableError extends Error {
   }
 }
 
-/** Thrown when the request is well-formed but the spec can't be honestly attested (callers → 4xx). */
+/**
+ * Thrown when the request is well-formed but the spec can't be honestly
+ * attested (callers → 4xx, or 503 while the program is switching revisions).
+ * `code` is a machine-readable reason the HTTP answer carries; `retryable`
+ * says whether the same request can succeed later.
+ */
 export class ModerationRejectError extends Error {
+  public readonly code?: string;
+  public readonly retryable?: boolean;
   constructor(
     public readonly httpStatus: number,
     message: string,
+    options: { code?: string; retryable?: boolean } = {},
   ) {
     super(message);
     this.name = "ModerationRejectError";
+    if (options.code !== undefined) this.code = options.code;
+    if (options.retryable !== undefined) this.retryable = options.retryable;
   }
 }
 

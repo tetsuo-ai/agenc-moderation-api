@@ -6,10 +6,17 @@ export {
   ModerationRejectError,
   ModerationSignerUnavailableError,
   SpecNotRetrievableError,
+  REFUSAL_CODES,
   type ModerationResult,
   type RequesterPayment,
   type AttestDeps,
 } from "./signer.js";
+export {
+  SIGNING_SURFACE_REVISION,
+  UNSUPPORTED_REVISION_CODE,
+  readSurfaceRevision,
+  requireSigningRevision,
+} from "./revision.js";
 export {
   DEFAULT_JOB_SPEC_REGISTRY_URL,
   ensureSpecRetrievable,

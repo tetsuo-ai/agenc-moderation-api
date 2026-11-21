@@ -11,6 +11,7 @@ import { loadModeratorSigner } from "./signer.js";
 import { moderationPolicyHashHex } from "./policy.js";
 import { scannerHashHex } from "./scan.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
+import { SIGNING_SURFACE_REVISION } from "./revision.js";
 
 export async function startServer(port = Number(process.env.PORT ?? 8787)): Promise<void> {
   const handler = createModerationApi();
@@ -42,4 +43,5 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
   console.log(
     `[${SERVICE_NAME}] ttl: ${config.attestationTtlSeconds}s; rate: ${config.rateLimitPerIp}/ip + ${config.rateLimitGlobal} global per ${config.rateLimitWindowMs}ms${config.upstashUrl ? " (shared)" : " (per-instance)"}`,
   );
+  console.log(`[${SERVICE_NAME}] signs for program revision ${SIGNING_SURFACE_REVISION} only`);
 }

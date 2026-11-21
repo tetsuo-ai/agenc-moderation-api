@@ -12,8 +12,9 @@
  *
  * `payer` is the wallet that pays for the approval. With one, a CLEAN answer
  * carries `payment`: the approval as a transaction signed by this service,
- * for that wallet to sign and send. Without one the request is refused (402)
- * unless the deployment sets REQUESTER_PAYS=false and pays itself.
+ * for that wallet to sign and send. For a task the payer must be the task's
+ * creator (revision 9). Without one the request is refused (402) unless the
+ * deployment sets REQUESTER_PAYS=false and pays itself.
  *   GET  /v1/policy      the exact policy bytes (sha256 == policy_hash)
  *   GET  /v1/info        service identity: signer pubkey, cluster, hashes, TTL
  *   GET  /v1/health      liveness
@@ -38,6 +39,7 @@ import { moderationPolicyBytes, moderationPolicyHashHex } from "./policy.js";
 import { SCANNER_DESCRIPTOR, scannerHashHex } from "./scan.js";
 import { openApiDocument } from "./openapi.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
+import { SIGNING_SURFACE_REVISION } from "./revision.js";
 
 const PDA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -117,7 +119,12 @@ function attestErrorResponse(error: unknown): Response {
     return errorJson(error.httpStatus, error.message, { code: error.code, retryable: true });
   }
   if (error instanceof ModerationRejectError) {
-    return errorJson(error.httpStatus, error.message);
+    // Coded refusals (revision 9 program rules, the revision gate) carry their
+    // machine-readable reason, and say when a retry can succeed.
+    return errorJson(error.httpStatus, error.message, {
+      ...(error.code !== undefined ? { code: error.code } : {}),
+      ...(error.retryable !== undefined ? { retryable: error.retryable } : {}),
+    });
   }
   return errorJson(502, error instanceof Error ? error.message : "Moderation failed.", {
     retryable: true,
@@ -334,6 +341,8 @@ async function handleInfo(config: ServiceConfig): Promise<Response> {
     // Who pays for an approval: the caller (it names a `payer` and sends the
     // transaction it gets back) or, when false, this service's signer.
     requesterPays: config.requesterPays,
+    // The only program revision this build signs for (see revision.ts).
+    signingRevision: SIGNING_SURFACE_REVISION,
     // The retrievability gate: every attestation implies retrievable content.
     jobSpecRegistry: {
       url: config.jobSpecRegistryUrl,
