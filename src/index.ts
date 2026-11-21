@@ -6,10 +6,26 @@ export {
   ModerationRejectError,
   ModerationSignerUnavailableError,
   SpecNotRetrievableError,
+  REFUSAL_CODES,
   type ModerationResult,
   type RequesterPayment,
   type AttestDeps,
 } from "./signer.js";
+export {
+  SIGNING_SURFACE_REVISION,
+  UNSUPPORTED_REVISION_CODE,
+  readSurfaceRevision,
+  requireSigningRevision,
+} from "./revision.js";
+export {
+  HEARTBEAT_INTERVAL_SECONDS,
+  buildModerationHeartbeatInstruction,
+  runModerationHeartbeat,
+  startHeartbeatTimer,
+  type HeartbeatDeps,
+  type HeartbeatOutcome,
+  type HeartbeatReport,
+} from "./heartbeat.js";
 export {
   DEFAULT_JOB_SPEC_REGISTRY_URL,
   ensureSpecRetrievable,

@@ -56,6 +56,19 @@ export interface ServiceConfig {
   /** Optional Upstash REST binding for a cross-instance shared limiter. */
   upstashUrl: string | null;
   upstashToken: string | null;
+  /**
+   * The weekly moderation liveness heartbeat (`heartbeat.ts`). Off unless
+   * HEARTBEAT_ENABLED plainly turns it on. It only ever sends with a signer
+   * the program allows to heartbeat, on a revision 9 program, and never
+   * changes the liveness window.
+   */
+  heartbeatEnabled: boolean;
+  /**
+   * The bearer secret `GET /v1/cron/heartbeat` requires (Vercel Cron sends
+   * the project's CRON_SECRET as `Authorization: Bearer <secret>`). Without it
+   * that trigger stays closed; the self-host timer does not need it.
+   */
+  cronSecret: string | null;
 }
 
 function intEnv(name: string, fallback: number, min = 0): number {
@@ -70,6 +83,12 @@ function intEnv(name: string, fallback: number, min = 0): number {
 function onUnlessOff(name: string): boolean {
   const raw = process.env[name]?.trim().toLowerCase();
   return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
+}
+
+/** A switch that is off unless it is plainly turned on. */
+function offUnlessOn(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "on" || raw === "yes";
 }
 
 function nonEmpty(value: string | undefined): string | null {
@@ -99,5 +118,7 @@ export function loadConfig(): ServiceConfig {
     requesterPays: onUnlessOff("REQUESTER_PAYS"),
     upstashUrl: nonEmpty(process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL),
     upstashToken: nonEmpty(process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN),
+    heartbeatEnabled: offUnlessOn("HEARTBEAT_ENABLED"),
+    cronSecret: nonEmpty(process.env.CRON_SECRET),
   };
 }

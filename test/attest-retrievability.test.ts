@@ -8,7 +8,8 @@
  * signing) with only the network boundary mocked:
  *
  *  - `createSolanaRpc` → a stub recording sendTransaction (no live RPC);
- *  - SDK account fetchers → task exists / signer is the global authority;
+ *  - SDK account fetchers → task exists / signer is the global authority /
+ *    the program is stamped revision 9;
  *  - global fetch → scripted registry (GET/PUT/ticket) responses;
  *  - ssrf-fetch `fetchJobSpecBody` → scripted specUri bodies.
  *
@@ -34,8 +35,13 @@ const state = vi.hoisted(() => ({
   /** On-chain ServiceListing stub data for the listing gate tests. */
   listingData: undefined as { specHash: Uint8Array; specUri: string } | undefined,
   /** On-chain Task/HireRecord data for revision-5 funded-hash checks. */
-  taskData: { description: new Uint8Array(64) } as { description: Uint8Array },
+  taskData: { description: new Uint8Array(64), creator: "" } as {
+    description: Uint8Array;
+    creator: string;
+  },
   hireRecordData: undefined as { task: string } | undefined,
+  /** The program's revision stamp (ProtocolConfig.surface_revision). */
+  surfaceRevision: 9,
 }));
 
 vi.mock("@solana/kit", async (importOriginal) => {
@@ -76,6 +82,7 @@ vi.mock("@tetsuo-ai/marketplace-sdk", async (importOriginal) => {
       exists: true,
       data: { moderationAuthority: state.moderatorAddress },
     }),
+    getDeployedSurface: async () => ({ surfaceRevision: state.surfaceRevision }),
   };
 });
 
@@ -102,6 +109,8 @@ import { createModerationApi } from "../src/router.js";
 import { __resetRateLimiterForTests } from "../src/rate-limit.js";
 
 const TASK = "9UEu2Gv9Q7DwBtumR2rUSq5g8v7b6mxn26ZNQCky82RJ";
+/** The task's creator: a wallet that is not this service's signer. */
+const CREATOR = base58Encode(new Uint8Array(32).fill(8));
 const REGISTRY = "https://registry.test";
 
 const PAYLOAD = {
@@ -150,8 +159,9 @@ beforeEach(() => {
   state.fetchHandler = undefined;
   state.specUriHandler = undefined;
   state.listingData = undefined;
-  state.taskData = { description: new Uint8Array(64) };
+  state.taskData = { description: new Uint8Array(64), creator: CREATOR };
   state.hireRecordData = undefined;
+  state.surfaceRevision = 9;
   state.blockhash = base58Encode(new Uint8Array(32).fill(7));
   vi.stubGlobal(
     "fetch",
@@ -176,7 +186,7 @@ describe("attestTask retrievability gate (signer configured)", () => {
   it("rejects a substituted hash for a revision-5 listing hire before any network or signing", async () => {
     installModeratorKey();
     const target = await canonicalHex(PAYLOAD);
-    state.taskData = { description: revision5Description("ab".repeat(32)) };
+    state.taskData = { description: revision5Description("ab".repeat(32)), creator: CREATOR };
     state.hireRecordData = { task: TASK };
 
     const error = await attestTask(DEPS, {
@@ -237,7 +247,7 @@ describe("attestTask retrievability gate (signer configured)", () => {
   it("attests when the registry already serves the spec (GET 200, hash-matching)", async () => {
     installModeratorKey();
     const target = await canonicalHex(PAYLOAD);
-    state.taskData = { description: revision5Description(target) };
+    state.taskData = { description: revision5Description(target), creator: CREATOR };
     state.hireRecordData = { task: TASK };
     const objectUrl = `${REGISTRY}/api/job-specs/${target}`;
     state.fetchHandler = (method, url) =>

@@ -61,16 +61,20 @@ const moderationResult = {
         transaction: {
           type: "string",
           description:
-            "Base64 wire transaction signed by this service. The payer is its fee payer; it " +
-            "holds a System transfer of `depositLamports` from the payer to `moderator` (left " +
-            "out when that is 0) followed by one record_*_moderation instruction.",
+            "Base64 wire transaction signed by this service. The payer is its fee payer. For a " +
+            "task (program revision 9) it holds one record_task_moderation instruction whose " +
+            "last account, rent_payer, is the payer: the program takes the deposit from the " +
+            "payer and returns it to the task's creator when the task is closed. For a listing " +
+            "it holds a System transfer of `depositLamports` from the payer to `moderator` (left " +
+            "out when that is 0) followed by one record_listing_moderation instruction.",
         },
         payer: { type: "string", description: "The wallet that pays (base58)." },
         depositLamports: {
           type: "string",
           description:
-            "Lamports moved from the payer to this service's signer: the deposit the new " +
-            "approval record takes. \"0\" when the record already exists.",
+            "The deposit the new approval record takes from the payer: as its rent payer for " +
+            "a task, by the transfer to this service's signer for a listing. \"0\" when the " +
+            "record already exists.",
         },
         lastValidBlockHeight: {
           type: "string",
@@ -111,10 +115,16 @@ const moderationResult = {
 const payerProperty = {
   type: "string",
   description:
-    "The wallet that pays for the approval (base58). A CLEAN answer then carries `payment`: " +
-    "the approval as a transaction for this wallet to sign and send. Required unless the " +
-    "deployment pays for approvals itself (GET /v1/info → requesterPays: false).",
+    "The wallet that pays for the approval (base58). For a task it must be the task's " +
+    "creator. A CLEAN answer then carries `payment`: the approval as a transaction for this " +
+    "wallet to sign and send. Required unless the deployment pays for approvals itself " +
+    "(GET /v1/info → requesterPays: false).",
 } as const;
+
+const revisionRefusalDescription =
+  "UNSUPPORTED_PROGRAM_REVISION (code, retryable): the program is not stamped revision 9, " +
+  "the only revision this build signs for. Nothing was signed. Also: no signer configured, " +
+  "or the signer is not authorized on this cluster.";
 
 const payerRequiredResponse = {
   description:
@@ -133,7 +143,13 @@ const errorShape = {
   properties: {
     ok: { type: "boolean", enum: [false] },
     error: { type: "string" },
-    code: { type: "string", description: "Machine-readable code (e.g. SPEC_NOT_RETRIEVABLE)." },
+    code: {
+      type: "string",
+      description:
+        "Machine-readable code: SPEC_NOT_RETRIEVABLE, MODERATOR_IS_TASK_CREATOR, " +
+        "MODERATOR_IS_LISTING_PROVIDER, PAYER_NOT_TASK_CREATOR, UNSUPPORTED_PROGRAM_REVISION " +
+        "or CRON_SECRET_MISSING.",
+    },
     retryable: { type: "boolean" },
     retryAfterSeconds: { type: "integer" },
   },
@@ -186,9 +202,14 @@ export function openApiDocument(): Record<string, unknown> {
             "402": payerRequiredResponse,
             "404": { description: "Listing not found on-chain.", content: { "application/json": { schema: errorShape } } },
             "409": { description: specNotRetrievableDescription, content: { "application/json": { schema: errorShape } } },
-            "422": { description: "Spec does not hash to the on-chain spec_hash.", content: { "application/json": { schema: errorShape } } },
+            "422": {
+              description:
+                "Spec does not hash to the on-chain spec_hash; or MODERATOR_IS_LISTING_PROVIDER: " +
+                "this service's signer provides the listing (program error 6434).",
+              content: { "application/json": { schema: errorShape } },
+            },
             "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
-            "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
+            "503": { description: revisionRefusalDescription, content: { "application/json": { schema: errorShape } } },
           },
         },
       },
@@ -232,9 +253,15 @@ export function openApiDocument(): Record<string, unknown> {
               description: `No job spec pinned and none provided; or ${specNotRetrievableDescription}`,
               content: { "application/json": { schema: errorShape } },
             },
-            "422": { description: "Spec does not hash to the expected job_spec_hash.", content: { "application/json": { schema: errorShape } } },
+            "422": {
+              description:
+                "Spec does not hash to the expected job_spec_hash; or MODERATOR_IS_TASK_CREATOR: " +
+                "this service's signer created the task (program error 6432); or " +
+                "PAYER_NOT_TASK_CREATOR: `payer` is not the task's creator (6433).",
+              content: { "application/json": { schema: errorShape } },
+            },
             "429": { description: "Rate limited.", content: { "application/json": { schema: errorShape } } },
-            "503": { description: "No signer configured / signer not authorized on this cluster.", content: { "application/json": { schema: errorShape } } },
+            "503": { description: revisionRefusalDescription, content: { "application/json": { schema: errorShape } } },
           },
         },
       },
@@ -304,6 +331,23 @@ export function openApiDocument(): Record<string, unknown> {
           },
         },
       },
+      "/v1/cron/heartbeat": {
+        get: {
+          summary: "Operator: run the weekly moderation liveness heartbeat check",
+          description:
+            "Called by Vercel Cron. Off unless HEARTBEAT_ENABLED is on; then it needs " +
+            "`Authorization: Bearer <CRON_SECRET>`. It sends a plain moderation_heartbeat (no " +
+            "window change) only on a revision 9 program, only when this service's signer may " +
+            "heartbeat, and only when the last heartbeat on chain is about a week old.",
+          security: [{ cronSecret: [] }],
+          responses: {
+            "200": { description: "What the check did: sent, or why not.", content: { "application/json": {} } },
+            "401": { description: "Missing or wrong cron secret.", content: { "application/json": { schema: errorShape } } },
+            "502": { description: "The check failed (retryable).", content: { "application/json": { schema: errorShape } } },
+            "503": { description: "CRON_SECRET_MISSING: the job is on but no secret is set.", content: { "application/json": { schema: errorShape } } },
+          },
+        },
+      },
       "/v1/policy": {
         get: {
           summary: "The exact policy document bytes (sha256 == on-chain policy_hash)",
@@ -329,6 +373,11 @@ export function openApiDocument(): Record<string, unknown> {
           description:
             "Only enforced when the deployment configures ATTEST_API_KEYS; the public " +
             "hosted deployment is open + rate-limited.",
+        },
+        cronSecret: {
+          type: "http",
+          scheme: "bearer",
+          description: "The deployment's CRON_SECRET (operator heartbeat trigger only).",
         },
       },
     },
