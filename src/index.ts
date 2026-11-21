@@ -18,6 +18,15 @@ export {
   requireSigningRevision,
 } from "./revision.js";
 export {
+  HEARTBEAT_INTERVAL_SECONDS,
+  buildModerationHeartbeatInstruction,
+  runModerationHeartbeat,
+  startHeartbeatTimer,
+  type HeartbeatDeps,
+  type HeartbeatOutcome,
+  type HeartbeatReport,
+} from "./heartbeat.js";
+export {
   DEFAULT_JOB_SPEC_REGISTRY_URL,
   ensureSpecRetrievable,
   jobSpecRegistryObjectUrl,

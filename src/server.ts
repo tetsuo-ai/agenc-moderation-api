@@ -11,6 +11,7 @@ import { loadModeratorSigner } from "./signer.js";
 import { moderationPolicyHashHex } from "./policy.js";
 import { scannerHashHex } from "./scan.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
+import { startHeartbeatTimer } from "./heartbeat.js";
 import { SIGNING_SURFACE_REVISION } from "./revision.js";
 
 export async function startServer(port = Number(process.env.PORT ?? 8787)): Promise<void> {
@@ -44,4 +45,11 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
     `[${SERVICE_NAME}] ttl: ${config.attestationTtlSeconds}s; rate: ${config.rateLimitPerIp}/ip + ${config.rateLimitGlobal} global per ${config.rateLimitWindowMs}ms${config.upstashUrl ? " (shared)" : " (per-instance)"}`,
   );
   console.log(`[${SERVICE_NAME}] signs for program revision ${SIGNING_SURFACE_REVISION} only`);
+  // The weekly liveness heartbeat: off unless HEARTBEAT_ENABLED turns it on.
+  if (config.heartbeatEnabled) {
+    startHeartbeatTimer(config);
+    console.log(`[${SERVICE_NAME}] heartbeat: on (checked hourly, sent weekly)`);
+  } else {
+    console.log(`[${SERVICE_NAME}] heartbeat: off`);
+  }
 }

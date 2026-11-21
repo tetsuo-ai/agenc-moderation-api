@@ -6,5 +6,6 @@
   "functions": {
     "api/index.ts": { "maxDuration": 120, "memory": 1024 }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
+  "crons": [{ "path": "/v1/cron/heartbeat", "schedule": "17 6 * * *" }]
 }
