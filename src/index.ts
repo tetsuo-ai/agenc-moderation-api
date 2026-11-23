@@ -39,6 +39,7 @@ export {
   scannerHashHex,
   SCANNER_DESCRIPTOR,
   MODERATION_STATUS,
+  type ModerationReason,
   type ScanResult,
   type Verdict,
 } from "./scan.js";

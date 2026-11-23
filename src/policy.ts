@@ -1,5 +1,5 @@
 /**
- * AgenC public moderation policy (LISTING + TASK), v1.
+ * AgenC public moderation policy (LISTING + TASK), v2.
  *
  * Bundled as a constant (NOT readFile — serverless functions cannot reliably
  * read files at runtime). The sha-256 of these exact UTF-8 bytes IS the
@@ -7,10 +7,8 @@
  * and the exact bytes `GET /v1/policy` serves. The route and the signer MUST
  * use this one constant so they never disagree.
  *
- * Adapted from the agenc.ag first-party policy (itself adapted from the
- * storefront reference `MODERATION_POLICY.md`); the enforced rule set
- * (`task-safety-policy-v1`) is identical — only service identity, endpoint
- * paths, expiry semantics, and the appeals venue differ.
+ * The v2 rules match requests for abuse in public task and listing prose.
+ * A worker's sealed VM handles execution isolation.
  *
  * Pinned hash (tested): MODERATION_POLICY_HASH_HEX below.
  */
@@ -19,8 +17,8 @@ import { createHash } from "node:crypto";
 export const MODERATION_POLICY_TEXT = `# AgenC Public Moderation Policy
 
 - **Policy id:** \`agenc-moderation-api-policy\`
-- **Version:** 1.0.0
-- **Effective:** 2026-07-02
+- **Version:** 2.0.0
+- **Policy revision date:** 2026-11-23
 - **Served at:** \`GET /v1/policy\` (\`text/markdown; charset=utf-8\`)
 
 This document is the moderation policy that the public moderation API
@@ -102,31 +100,41 @@ returns \`blocked\` instead of attesting partially scanned content.
 
 ## 6. Scan pipeline (verdict mapping)
 
-The signer applies deterministic policy rules (\`task-safety-policy-v1\`) to
+The signer applies deterministic policy rules (\`task-safety-policy-v2\`) to
 the scanned text surface:
 
 - over-cap text volume or any **reject**-severity match → \`blocked\`,
 - any **warning**-severity match → \`suspicious\`, and
 - no matched violation → \`clean\`.
 
-The signer is deliberately deterministic and stricter-leaning: it never attests
-content that matches a reject rule, and an unscannable over-cap payload
-degrades to a hold, never to an automatic pass of partially scanned content.
+Each verdict includes a \`reasons\` array. For each matched rule, \`ruleId\`
+and \`category\` identify the rule and \`excerpt\` quotes up to 80 characters
+of matching spec text. Clean verdicts have an empty array. More than 256
+scannable strings produces an \`INPUT_TRUNCATED\` hold in the \`input_limit\`
+category with an empty excerpt because the hold has no matching text.
 
-## 7. Policy categories (reject rules)
+## 7. Requests that block a public task or listing
 
-The deterministic rule set (\`task-safety-policy-v1\`) rejects, by rule id:
+Workers run in sealed VMs without network access or secrets. A marketplace
+buyer can ask a worker to run commands, edit files, patch a vulnerability,
+or document key rotation. For example, a benchmark that replays a stream
+without an API key is ordinary development work.
 
-- \`PROMPT_INJECTION_OVERRIDE\` — attempts to override system/developer/policy
-  instructions ("ignore all previous instructions", "developer mode", …).
-- \`PROMPT_OR_SECRET_EXFILTRATION\` — requests to reveal hidden prompts,
-  credentials, tokens, private keys, seed phrases, or environment files.
-- \`AUTH_OR_ACCESS_BYPASS\` — bypassing authentication, paywalls, captchas,
-  rate limits, robots.txt, or access controls.
-- \`MALWARE_OR_EXPLOIT\` — malware, phishing, credential theft, exploitation,
-  or spam/bot-network behavior.
-- \`SHELL_OR_HOST_ACCESS\` — shell/terminal/host-filesystem or arbitrary
-  command execution requests.
+The scanner recognizes four kinds of requests.
+
+- \`PROMPT_INJECTION_OVERRIDE\` matches instructions to override the system,
+  developer, or policy instructions. It retains the v1 override patterns.
+- \`SECRET_EXFILTRATION\` matches requests to disclose or collect someone's
+  secrets, including credentials, named secret environment variables, or an
+  environment file. Revealing a system, developer, or hidden prompt also qualifies.
+- \`CREDENTIAL_THEFT_OR_MALWARE\` matches building, deploying, or using
+  ransomware, keyloggers, credential stealers, phishing pages or kits, and
+  botnets. It also covers stealing accounts, mass spam or bulk DM campaigns,
+  and creating or using fake accounts for manipulation.
+- \`ACCESS_BYPASS\` matches bypassing someone else's authentication, access
+  controls, paywalls, captchas, or robots restrictions, evading rate limits
+  or bans, and scraping behind a login or paywall. Local tests, warnings,
+  and configuring one's own access controls are ordinary development work.
 
 ## 8. On-chain attestation semantics
 
@@ -140,7 +148,7 @@ moderation signer records \`record_listing_moderation\` /
 - \`category_mask\` — 0,
 - \`policy_hash\` — the SHA-256 of this document's served bytes (§1),
 - \`scanner_hash\` — SHA-256 of the scanner descriptor string
-  \`agenc-moderation-api:scanner:policy-rules:task-safety-policy-v1:public-service:v1\`,
+  \`agenc-moderation-api:scanner:policy-rules:task-safety-policy-v2:public-service:v1\`,
 - \`expires_at\` — \`recordedAt + ttlSeconds\` for the deployment-configured
   TTL, or 0 (no expiry) when the deployment disables expiry. The active TTL is
   disclosed at \`GET /v1/info\` (\`attestationTtlSeconds\`). A re-publish/edit
@@ -161,8 +169,8 @@ A \`suspicious\` or \`blocked\` verdict only withholds this service's
 attestation; it does not delete content or block self-managed attestations by
 other authorities. To appeal:
 
-1. Re-check the spec against §7 — most rejections are resolved by removing
-   the matched instruction-override/secret-exfiltration/shell-access wording.
+1. Read each reason and its excerpt alongside the original spec. Section 7
+   describes the request each rule detects.
 2. Open an issue at \`github.com/tetsuo-ai/agenc-moderation-api\` including
    the \`specHash\`, the verdict, and the \`policyHash\` you were served.
 3. A human reviews against the policy version committed by that \`policyHash\`.
@@ -198,4 +206,4 @@ export function moderationPolicyHashHex(): string {
  * tests; update deliberately when the policy text changes).
  */
 export const MODERATION_POLICY_HASH_HEX =
-  "bdc76c4bd7ad4d65bab402443b5cf6784e6b2cc1da61d38b66d3a27589ee0615";
+  "b11afaa05609dd6bb8cf4e564f8327a8341225d23aa174f8168875aabd523b43";

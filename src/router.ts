@@ -48,6 +48,7 @@ import { openApiDocument } from "./openapi.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 import { HEARTBEAT_INTERVAL_SECONDS, runModerationHeartbeat } from "./heartbeat.js";
 import { SIGNING_SURFACE_REVISION } from "./revision.js";
+import { redactSecrets } from "./redact.js";
 
 const PDA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -72,7 +73,8 @@ function json(body: unknown, status = 200, extra?: Record<string, string>): Resp
 }
 
 function errorJson(status: number, message: string, extra?: Record<string, unknown>): Response {
-  return json({ ok: false, error: message, ...extra }, status);
+  // A transport error can echo the RPC URL, which may carry a provider key.
+  return json({ ok: false, error: redactSecrets(message), reasons: [], ...extra }, status);
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
@@ -156,15 +158,11 @@ async function gatePost(config: ServiceConfig, request: Request): Promise<Respon
         : decision.deniedBy === "shared-store-error"
           ? "Rate-limit store temporarily unavailable; requests are paused to protect the signer. Retry shortly."
           : "Too many requests from this address. Retry shortly.";
-    return new Response(JSON.stringify({ ok: false, error: message, retryAfterSeconds: decision.retryAfterSeconds }), {
-      status: 429,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store",
-        "retry-after": String(decision.retryAfterSeconds),
-        ...CORS_HEADERS,
-      },
-    });
+    return json(
+      { ok: false, error: message, reasons: [], retryAfterSeconds: decision.retryAfterSeconds },
+      429,
+      { "retry-after": String(decision.retryAfterSeconds) },
+    );
   }
   return null;
 }
@@ -307,6 +305,7 @@ async function handleCompatAttest(config: ServiceConfig, request: Request): Prom
     moderation: {
       verdict: result.verdict,
       riskScore: result.riskScore,
+      reasons: result.reasons,
       specHash: result.specHash,
       policyHash: result.policyHash,
       scannerHash: scannerHashHex(),

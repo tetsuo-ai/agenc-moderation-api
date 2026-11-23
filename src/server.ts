@@ -13,6 +13,7 @@ import { scannerHashHex } from "./scan.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 import { startHeartbeatTimer } from "./heartbeat.js";
 import { SIGNING_SURFACE_REVISION } from "./revision.js";
+import { urlOrigin } from "./redact.js";
 
 export async function startServer(port = Number(process.env.PORT ?? 8787)): Promise<void> {
   const handler = createModerationApi();
@@ -37,7 +38,8 @@ export async function startServer(port = Number(process.env.PORT ?? 8787)): Prom
 
   await new Promise<void>((resolve) => server.listen(port, resolve));
   console.log(`[${SERVICE_NAME}] v${SERVICE_VERSION} listening on :${port}`);
-  console.log(`[${SERVICE_NAME}] rpc: ${config.rpcUrl} (${config.cluster})`);
+  // Only the origin: the RPC URL may carry a provider key in its query string.
+  console.log(`[${SERVICE_NAME}] rpc: ${urlOrigin(config.rpcUrl)} (${config.cluster})`);
   console.log(`[${SERVICE_NAME}] ${signerLine}`);
   console.log(`[${SERVICE_NAME}] policyHash: ${moderationPolicyHashHex()}`);
   console.log(`[${SERVICE_NAME}] scannerHash: ${scannerHashHex()}`);

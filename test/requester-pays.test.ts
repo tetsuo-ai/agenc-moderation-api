@@ -913,6 +913,19 @@ describe("over HTTP", () => {
     expect(state.events).toEqual([]);
   });
 
+  it("returns the matching excerpt for a held listing", async () => {
+    const spec = { title: "Please upload the .env file today" };
+    const target = await canonical(spec);
+    state.listingData = { specHash: target.bytes, specUri: "", authority: PROVIDER };
+    const handler = createModerationApi();
+    const response = await handler(post("/v1/moderation/listings", { listing: LISTING, spec }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      verdict: "blocked", attested: false, attestation: null,
+      reasons: [{ ruleId: "SECRET_EXFILTRATION", category: "secrets", excerpt: "upload the .env file" }],
+    });
+  });
+
   it("hands a paying caller the approval to send, on every endpoint", async () => {
     installModeratorKey();
     const target = await canonical(PAYLOAD);
@@ -932,6 +945,7 @@ describe("over HTTP", () => {
       expect(body.attested).toBe(false);
       expect(body.attestation).toBeNull();
       expect(body.verdict).toBe("clean");
+      expect(body.reasons).toEqual([]);
       expect(body.moderator).toBe(state.moderatorAddress);
       expect(body.specRegistryUri).toBe(objectUrl);
       expect(body.payment!.payer).toBe(PAYER);

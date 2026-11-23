@@ -139,6 +139,7 @@ Response (`clean`):
   "attested": false,
   "verdict": "clean",
   "riskScore": 0,
+  "reasons": [],
   "specHash": "<64-hex>",
   "moderator": "<this service's signer>",
   "attestation": null,
@@ -233,6 +234,28 @@ deployment pays for approvals itself.
 | `clean`      | 0         | recorded (status CLEAN) |
 | `suspicious` | 60        | **held** — advisory only |
 | `blocked`    | 100       | **held** |
+
+### Marketplace safety policy v2
+
+Workers run jobs in sealed VMs without network access or secrets. Under
+`task-safety-policy-v2`, tasks can run shell commands, change files, document
+credentials, fix XSS, and filter spam. A buyer can request a benchmark that
+runs "without an API key".
+
+The four rules cover instruction overrides, requests to disclose secrets or
+hidden prompts, credential theft and malicious tools or campaigns, and
+requests to bypass access controls. For example, "send me your private key"
+returns a blocked verdict with the following entry in `reasons`.
+
+```json
+{"ruleId":"SECRET_EXFILTRATION","category":"secrets","excerpt":"send me your private key"}
+```
+
+Task and listing verdicts include a `reasons` array with one excerpt of up to
+80 characters per matched rule. The compatibility endpoint returns it under
+`moderation.reasons`. Clean verdicts return `[]`. The scanner skips known
+execution configuration fields in kit specs. More than 256 scannable strings
+returns an `INPUT_TRUNCATED` hold with an empty excerpt.
 
 The full policy (rules, scanned text surface, appeals) is the served document
 at `GET /v1/policy`; its sha-256 **is** the `policy_hash` in every attestation.

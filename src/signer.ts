@@ -97,7 +97,7 @@ import {
 import { base58Decode, base58Encode } from "./base58.js";
 import { fetchJobSpecBody, JobSpecCheckError } from "./ssrf-fetch.js";
 import { moderationPolicyHashBytes, moderationPolicyHashHex } from "./policy.js";
-import { MODERATION_STATUS, scanPayload, scannerHashBytes, type Verdict } from "./scan.js";
+import { MODERATION_STATUS, scanPayload, scannerHashBytes, type ModerationReason, type Verdict } from "./scan.js";
 import {
   ModerationRejectError,
   ModerationSignerUnavailableError,
@@ -405,6 +405,7 @@ export async function resolveSpecAgainstHash(params: {
 export interface ModerationResult {
   verdict: Verdict;
   riskScore: number;
+  reasons: ModerationReason[];
   /** Canonical spec hash (hex) — equals the on-chain spec_hash. */
   specHash: string;
   /**
@@ -748,6 +749,7 @@ export async function attestListing(
     return {
       verdict: scan.verdict,
       riskScore: scan.riskScore,
+      reasons: scan.reasons,
       specHash: resolved.specHashHex,
       moderator: moderator?.address ?? null,
       attestation: null,
@@ -796,6 +798,7 @@ export async function attestListing(
     return {
       verdict: scan.verdict,
       riskScore: scan.riskScore,
+      reasons: scan.reasons,
       specHash: resolved.specHashHex,
       moderator: moderator.address,
       attestation: null,
@@ -819,6 +822,7 @@ export async function attestListing(
   return {
     verdict: scan.verdict,
     riskScore: scan.riskScore,
+    reasons: scan.reasons,
     specHash: resolved.specHashHex,
     moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
@@ -999,6 +1003,7 @@ export async function attestTask(
     return {
       verdict: scan.verdict,
       riskScore: scan.riskScore,
+      reasons: scan.reasons,
       specHash: resolved.specHashHex,
       moderator: moderator?.address ?? null,
       attestation: null,
@@ -1056,6 +1061,7 @@ export async function attestTask(
     return {
       verdict: scan.verdict,
       riskScore: scan.riskScore,
+      reasons: scan.reasons,
       specHash: resolved.specHashHex,
       moderator: moderator.address,
       attestation: null,
@@ -1078,6 +1084,7 @@ export async function attestTask(
   return {
     verdict: scan.verdict,
     riskScore: scan.riskScore,
+    reasons: scan.reasons,
     specHash: resolved.specHashHex,
     moderator: moderator.address,
     attestation: { signature, recordedAt: new Date().toISOString(), expiresAt: ttl.iso },
