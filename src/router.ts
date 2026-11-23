@@ -48,6 +48,7 @@ import { openApiDocument } from "./openapi.js";
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 import { HEARTBEAT_INTERVAL_SECONDS, runModerationHeartbeat } from "./heartbeat.js";
 import { SIGNING_SURFACE_REVISION } from "./revision.js";
+import { redactSecrets } from "./redact.js";
 
 const PDA_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -72,7 +73,8 @@ function json(body: unknown, status = 200, extra?: Record<string, string>): Resp
 }
 
 function errorJson(status: number, message: string, extra?: Record<string, unknown>): Response {
-  return json({ ok: false, error: message, reasons: [], ...extra }, status);
+  // A transport error can echo the RPC URL, which may carry a provider key.
+  return json({ ok: false, error: redactSecrets(message), reasons: [], ...extra }, status);
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
