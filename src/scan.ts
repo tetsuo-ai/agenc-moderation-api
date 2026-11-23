@@ -60,7 +60,7 @@ const codePrefix = /[`'"]?(?:\$\{?)?/;
 // for passwords. Possessives can name any individual or organization.
 const secretModifiers = [
   /me|us|with|a|an|the|all|any|every|each|of|copy|screenshot|contents?|values?|list/,
-  /my|our|your|their|his|her|its|own|other|[\w.-]+['’]s?/,
+  /my|our|your|their|his|her|its|own|other|(?:release|build|support|security)\s+(?:engineer|operator|admin)['’]s|[\w.-]+['’]s?/,
   /raw|actual|real|live|saved|stored|personal|production|prod|master|root|admin/,
   /accounts?|users?|customers?|employees?|victims?|login|browser|database|banking|cloud|wallet/,
   /(?:12|24)[ -]word/,
@@ -84,13 +84,16 @@ function isQuotedExample(match: RegExpExecArray): boolean {
   const context = lead + " " + tail.slice(1).split(/[.!?;\n]/, 1)[0].slice(0, 100);
   const educational = /\b(?:regression tests?|test cases?|tutorials?|training|handouts?|documentation)\b/i.test(context);
   if (/\b(?:obey|execute|follow)\s+(?:the|this)\s+quoted (?:example|fixture)\s+['"‘“]$/i.test(lead)) return false;
-  return (labeled && educational)
+  const rejectedFixture = /\btests?\s+(?:must|should|will)\s+(?:reject|block)\s+(?:the|this)\s+(?:input|message|instruction)\s*$/i.test(lead.slice(0, -1));
+  return rejectedFixture || (labeled && educational)
     || /^\s+(?:as an example of (?:a scam|an? (?:unsafe request|override attempt))|is an? (?:unsafe request|override attempt))\b/i.test(tail.slice(1));
 }
 
 function isSecretReference(match: RegExpExecArray): boolean {
   const lead = beforeMatch(match);
   if (isQuotedExample(match)) return true;
+  // A logger emitting a secret is the failure condition of this assertion.
+  if (/\btests?\s+that\s+fail\s+if\s+(?:a|the|our)\s+(?:debug statement|logger|log statement)\s+(?:can|could|would)\s+$/i.test(lead)) return true;
   // A coordinated prohibition applies only to verbs in the same list.
   if (/\b(?:do not|must not|never)\s+(?:(?:steal|dump|request|expose|read|print|send|share|upload|copy|reveal|leak)\s*,\s*)+(?:(?:or|and)\s+)?$/i.test(lead)) return true;
   if (/\b(?:never|must not|do not)\s+(?:to\s+)?(?:ask|tell)\s+(?:(?:a|an|the|our)\s+)?(?:users?|customers?|employees?)\s+to\s+$/i.test(lead)) return true;
@@ -130,6 +133,7 @@ function isLocalScope(match: RegExpExecArray): boolean {
 }
 
 function isAllowedAccess(match: RegExpExecArray): boolean {
+  if (/\b(?:an?\s+)?alert\s+(?:when|if)\s+(?:users?|visitors?|clients?)\s+(?:try|tries|attempt|attempts)\s+to\s+$/i.test(beforeMatch(match))) return true;
   if (/\b(?:detect|block|prevent|stop)\s+attempts?\s+to\s+$/i.test(beforeMatch(match))) return true;
   const after = afterMatch(match);
   if (/\b(?:their|[\w.-]+['’]s)\s/i.test(match[0])) return false;
