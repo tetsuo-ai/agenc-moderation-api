@@ -6,9 +6,23 @@
 
 import { SERVICE_NAME, SERVICE_VERSION } from "./version.js";
 
+const reasons = {
+  type: "array",
+  description: "One excerpt per matched rule. INPUT_TRUNCATED has an empty excerpt.",
+  items: {
+    type: "object",
+    required: ["ruleId", "category", "excerpt"],
+    properties: {
+      ruleId: { type: "string" },
+      category: { type: "string" },
+      excerpt: { type: "string", maxLength: 80 },
+    },
+  },
+} as const;
+
 const moderationResult = {
   type: "object",
-  required: ["ok", "attested", "verdict", "riskScore", "specHash", "attestation", "policyHash"],
+  required: ["ok", "attested", "verdict", "riskScore", "reasons", "specHash", "attestation", "policyHash"],
   properties: {
     ok: { type: "boolean" },
     attested: {
@@ -17,6 +31,7 @@ const moderationResult = {
         "True when a CLEAN verdict was recorded on-chain by this service. False when the " +
         "caller pays: the approval is then recorded by the transaction in `payment`.",
     },
+    reasons,
     verdict: { type: "string", enum: ["clean", "suspicious", "blocked"] },
     riskScore: { type: "integer", minimum: 0, maximum: 100 },
     specHash: {
@@ -139,10 +154,11 @@ const specNotRetrievableDescription =
 
 const errorShape = {
   type: "object",
-  required: ["ok", "error"],
+  required: ["ok", "error", "reasons"],
   properties: {
     ok: { type: "boolean", enum: [false] },
     error: { type: "string" },
+    reasons,
     code: {
       type: "string",
       description:
@@ -308,7 +324,11 @@ export function openApiDocument(): Record<string, unknown> {
                     properties: {
                       ok: { type: "boolean" },
                       attested: { type: "boolean" },
-                      moderation: { type: "object" },
+                      moderation: {
+                        type: "object",
+                        required: ["reasons"],
+                        properties: { reasons },
+                      },
                       txSignature: { type: ["string", "null"] },
                       retrievable: {
                         type: "boolean",

@@ -6,6 +6,11 @@ import { createHash } from "node:crypto";
 
 const BASE = "http://svc.test";
 
+const overrideAndDumpReasons = [
+  { ruleId: "PROMPT_INJECTION_OVERRIDE", category: "prompt_injection", excerpt: "Ignore all previous instructions" },
+  { ruleId: "SECRET_EXFILTRATION", category: "secrets", excerpt: "dump the .env file" },
+];
+
 function post(path: string, body: unknown, headers?: Record<string, string>): Request {
   return new Request(`${BASE}${path}`, {
     method: "POST",
@@ -55,7 +60,19 @@ describe("GET surface", () => {
     const res = await handler(new Request(`${BASE}/openapi.json`));
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.openapi).toBe("3.1.0");
-    expect(Object.keys(body.paths as object)).toContain("/v1/moderation/tasks");
+    const paths = body.paths as Record<string, {
+      post: { responses: Record<string, { content: Record<string, { schema: object }> }> };
+    }>;
+    const reasons = {
+      required: expect.arrayContaining(["reasons"]),
+      properties: { reasons: { type: "array", items: {
+        required: ["ruleId", "category", "excerpt"], properties: { excerpt: { maxLength: 80 } },
+      } } },
+    };
+    for (const path of ["/v1/moderation/tasks", "/v1/moderation/listings", "/api/task-moderation/attest"]) {
+      const schema = paths[path].post.responses["200"].content["application/json"].schema;
+      expect(schema).toMatchObject(path.startsWith("/api/") ? { properties: { moderation: reasons } } : reasons);
+    }
   });
 
   it("is CORS-open", async () => {
@@ -79,6 +96,7 @@ describe("POST validation", () => {
       new Request(`${BASE}/v1/moderation/tasks`, { method: "POST", body: "{nope" }),
     );
     expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ reasons: [] });
   });
 
   it("rejects a missing/malformed task PDA", async () => {
@@ -126,6 +144,7 @@ describe("POST validation", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.ok).toBe(true);
     expect(body.verdict).toBe("clean");
+    expect(body.reasons).toEqual([]);
     expect(body.attested).toBe(false);
     expect(body.attestation).toBeNull();
     expect(body.specHash).toMatch(/^[0-9a-f]{64}$/);
@@ -141,6 +160,7 @@ describe("POST validation", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.verdict).toBe("blocked");
+    expect(body.reasons).toEqual(overrideAndDumpReasons);
     expect(body.attested).toBe(false);
   });
 
@@ -174,6 +194,7 @@ describe("POST validation", () => {
     expect(body.attested).toBe(false);
     expect(body.txSignature).toBeNull();
     expect(body.moderation.verdict).toBe("clean");
+    expect(body.moderation.reasons).toEqual([]);
     expect(body.moderation.payloadHash).toMatch(/^[0-9a-f]{64}$/);
   });
 
@@ -199,6 +220,7 @@ describe("POST validation", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { attested: boolean; moderation: Record<string, unknown> };
     expect(body.moderation.verdict).toBe("blocked");
+    expect(body.moderation.reasons).toEqual(overrideAndDumpReasons);
     expect(body.attested).toBe(false);
   });
 
